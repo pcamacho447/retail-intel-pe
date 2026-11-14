@@ -125,7 +125,7 @@ pub async fn run_ingest(
                     tracing::info!(
                         retailer = slug,
                         category = %category,
-                        checkpoint_date = %cp.updated_at.date_naive(),
+                        checkpoint_date = %business_date_lima(cp.updated_at),
                         run_date = %run_date,
                         checkpoint_page_size = ?cp.page_size,
                         run_page_size = config.page_size,

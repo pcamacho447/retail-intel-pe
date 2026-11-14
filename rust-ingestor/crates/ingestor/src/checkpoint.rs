@@ -23,7 +23,7 @@ impl CheckpointState {
     #[must_use]
     pub fn is_valid_for_run(&self, category: &str, run_date: NaiveDate, page_size: usize) -> bool {
         self.category == category
-            && self.updated_at.date_naive() == run_date
+            && crate::runner::business_date_lima(self.updated_at) == run_date
             && self.page_size.is_none_or(|ps| ps == page_size)
     }
 }
@@ -281,14 +281,15 @@ mod tests {
 
     #[test]
     fn checkpoint_is_valid_for_run_checks_date_category_and_page_size() {
-        let today = Utc::now().date_naive();
+        let now = Utc::now();
+        let today = crate::runner::business_date_lima(now);
         let cp = CheckpointState {
             retailer: "metro".to_string(),
             category: "leche/entera".to_string(),
             next_offset: 20,
             pages_completed: 1,
             extraction_run_id: Uuid::new_v4(),
-            updated_at: Utc::now(),
+            updated_at: now,
             completed: false,
             page_size: Some(20),
         };
@@ -327,5 +328,28 @@ mod tests {
         assert!(legacy_cp.is_valid_for_run("leche/entera", today, 50));
         assert!(!legacy_cp.is_valid_for_run("leche/entera", tomorrow, 20));
         assert!(!legacy_cp.is_valid_for_run("leche entera", today, 20));
+    }
+
+    #[test]
+    fn checkpoint_is_valid_for_run_uses_lima_business_date() {
+        use chrono::TimeZone;
+        let d = |y, m, day| NaiveDate::from_ymd_opt(y, m, day).unwrap();
+        let mut cp = CheckpointState {
+            retailer: "metro".to_string(),
+            category: "lacteos".to_string(),
+            next_offset: 20,
+            pages_completed: 1,
+            extraction_run_id: Uuid::new_v4(),
+            // 20:00 Lima del 2026-11-14 == 01:00 UTC del 2026-11-15
+            updated_at: Utc.with_ymd_and_hms(2026, 11, 15, 1, 0, 0).unwrap(),
+            completed: false,
+            page_size: Some(20),
+        };
+        assert!(cp.is_valid_for_run("lacteos", d(2026, 11, 14), 20));
+        assert!(!cp.is_valid_for_run("lacteos", d(2026, 11, 15), 20));
+        // 23:59:59 Lima del 2026-11-13 == 04:59:59 UTC del 2026-11-14
+        cp.updated_at = Utc.with_ymd_and_hms(2026, 11, 14, 4, 59, 59).unwrap();
+        assert!(cp.is_valid_for_run("lacteos", d(2026, 11, 13), 20));
+        assert!(!cp.is_valid_for_run("lacteos", d(2026, 11, 14), 20));
     }
 }
