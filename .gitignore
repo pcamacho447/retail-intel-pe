@@ -10,8 +10,11 @@ __pycache__/
 .pytest_cache/
 
 # Lakehouse data & runtime state
-data/bronze/
+data/
 *.parquet
+*.duckdb
+*.db
+*.sqlite
 
 # Superpowers scratch
 .superpowers/
