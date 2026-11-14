@@ -6,7 +6,7 @@ use anyhow::{anyhow, Context};
 use governor::clock::DefaultClock;
 use governor::state::{InMemoryState, NotKeyed};
 use governor::{Quota, RateLimiter};
-use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, ACCEPT_LANGUAGE};
+use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, ACCEPT_LANGUAGE, RETRY_AFTER};
 
 #[derive(Debug, Clone)]
 pub struct HttpResponseData {
@@ -115,6 +115,7 @@ impl RateLimitedHttpClient {
                                         attempt,
                                         url,
                                         &format!("body read error: {err}"),
+                                        None,
                                     )
                                     .await;
                                     continue;
@@ -127,6 +128,15 @@ impl RateLimitedHttpClient {
                         }
                     } else if status == 429 || (500..=599).contains(&status) {
                         self.requests_error.fetch_add(1, Ordering::Relaxed);
+                        let retry_after_ms = if status == 429 || status == 503 {
+                            resp.headers()
+                                .get(RETRY_AFTER)
+                                .and_then(|h| h.to_str().ok())
+                                .and_then(|s| s.trim().parse::<u64>().ok())
+                                .map(|secs| secs.min(30).saturating_mul(1000))
+                        } else {
+                            None
+                        };
                         let body_snippet: String = resp
                             .text()
                             .await
@@ -135,32 +145,37 @@ impl RateLimitedHttpClient {
                             .take(200)
                             .collect();
                         if attempt < self.max_retries {
-                            self.sleep_backoff(attempt, url, &format!("HTTP {status}"))
-                                .await;
+                            self.sleep_backoff(
+                                attempt,
+                                url,
+                                &format!("HTTP {status}"),
+                                retry_after_ms,
+                            )
+                            .await;
                             continue;
                         }
                         return Err(anyhow!(
                             "HTTP request to {url} failed with status {status} after {} retries: {body_snippet:?}",
                             self.max_retries
                         ));
-                    } else {
-                        self.requests_error.fetch_add(1, Ordering::Relaxed);
-                        let body_snippet: String = resp
-                            .text()
-                            .await
-                            .unwrap_or_default()
-                            .chars()
-                            .take(200)
-                            .collect();
-                        return Err(anyhow!(
-                            "HTTP request to {url} failed with non-retryable status {status}: {body_snippet:?}"
-                        ));
                     }
+
+                    self.requests_error.fetch_add(1, Ordering::Relaxed);
+                    let body_snippet: String = resp
+                        .text()
+                        .await
+                        .unwrap_or_default()
+                        .chars()
+                        .take(200)
+                        .collect();
+                    return Err(anyhow!(
+                        "HTTP request to {url} failed with non-retryable status {status}: {body_snippet:?}"
+                    ));
                 }
                 Err(err) => {
                     self.requests_error.fetch_add(1, Ordering::Relaxed);
                     if attempt < self.max_retries {
-                        self.sleep_backoff(attempt, url, &format!("transport error: {err}"))
+                        self.sleep_backoff(attempt, url, &format!("transport error: {err}"), None)
                             .await;
                         continue;
                     }
@@ -175,9 +190,16 @@ impl RateLimitedHttpClient {
         unreachable!("retry loop returns on final attempt")
     }
 
-    async fn sleep_backoff(&self, attempt: u32, url: &str, reason: &str) {
+    async fn sleep_backoff(
+        &self,
+        attempt: u32,
+        url: &str,
+        reason: &str,
+        retry_after_ms: Option<u64>,
+    ) {
         let shift = attempt.min(16);
-        let backoff_ms = self.base_backoff_ms.saturating_mul(1u64 << shift);
+        let exp_backoff_ms = self.base_backoff_ms.saturating_mul(1u64 << shift);
+        let backoff_ms = exp_backoff_ms.max(retry_after_ms.unwrap_or(0));
         tracing::warn!(
             url = url,
             attempt = attempt + 1,
@@ -189,6 +211,7 @@ impl RateLimitedHttpClient {
         tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
     }
 
+    #[must_use]
     pub fn stats(&self) -> HttpStats {
         HttpStats {
             requests_ok: self.requests_ok.load(Ordering::Relaxed),
@@ -221,7 +244,8 @@ mod tests {
                 tokio::spawn(async move {
                     let mut buf = [0u8; 2048];
                     let _ = socket.read(&mut buf).await;
-                    let i = idx.fetch_add(1, std::sync::atomic::Ordering::SeqCst) as usize;
+                    let i = usize::try_from(idx.fetch_add(1, std::sync::atomic::Ordering::SeqCst))
+                        .unwrap_or(0);
                     let (status, body) = responses
                         .get(i)
                         .copied()
@@ -247,6 +271,66 @@ mod tests {
         format!("http://{addr}")
     }
 
+    async fn spawn_mock_server_raw(responses: Vec<String>) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let responses = Arc::new(responses);
+        let idx = Arc::new(AtomicU64::new(0));
+
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let responses = responses.clone();
+                let idx = idx.clone();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 2048];
+                    let _ = socket.read(&mut buf).await;
+                    let i = usize::try_from(idx.fetch_add(1, std::sync::atomic::Ordering::SeqCst))
+                        .unwrap_or(0);
+                    let raw = responses
+                        .get(i)
+                        .cloned()
+                        .unwrap_or_else(|| responses.last().cloned().unwrap_or_default());
+                    let _ = socket.write_all(raw.as_bytes()).await;
+                });
+            }
+        });
+
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn http_client_honors_retry_after_header_on_429() {
+        let base_url = spawn_mock_server_raw(vec![
+            "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 1\r\nContent-Length: 12\r\nConnection: close\r\n\r\nrate limited".to_string(),
+            "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".to_string(),
+        ])
+        .await;
+        let client = RateLimitedHttpClient::with_config(
+            NonZeroU32::new(50).unwrap(),
+            3,
+            5,
+            Duration::from_secs(5),
+        )
+        .unwrap();
+
+        let start = Instant::now();
+        let resp = client
+            .get_text(&format!("{base_url}/retry_after"))
+            .await
+            .unwrap();
+        let elapsed = start.elapsed();
+
+        assert_eq!(resp.status, 200);
+        assert_eq!(resp.body, "ok");
+        assert!(
+            elapsed >= Duration::from_millis(900),
+            "expected >= 900ms delay due to Retry-After: 1, got {elapsed:?}"
+        );
+    }
+
     #[tokio::test]
     async fn http_client_enforces_rate_limit_at_most_2_req_per_sec() {
         let base_url = spawn_mock_server(vec![(200, "ok")]).await;
@@ -260,8 +344,7 @@ mod tests {
         let elapsed = start.elapsed();
         assert!(
             elapsed >= Duration::from_millis(900),
-            "expected >= 900ms for 3 requests at <=2 req/s, got {:?}",
-            elapsed
+            "expected >= 900ms for 3 requests at <=2 req/s, got {elapsed:?}"
         );
     }
 

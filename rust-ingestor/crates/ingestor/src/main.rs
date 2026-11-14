@@ -1,3 +1,9 @@
+#![allow(
+    clippy::missing_errors_doc,
+    clippy::missing_panics_doc,
+    clippy::too_many_lines
+)]
+
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -24,6 +30,7 @@ pub enum RetailerArg {
 }
 
 impl RetailerArg {
+    #[must_use]
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::PlazaVea => "plazavea",

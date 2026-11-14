@@ -1,3 +1,5 @@
+use std::fmt::Write;
+
 use serde_json::Value;
 
 use crate::domain::normalize_opt_string;
@@ -30,8 +32,7 @@ pub(crate) fn encode_url_segment(input: &str) -> String {
         if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
             encoded.push(*byte as char);
         } else {
-            encoded.push('%');
-            encoded.push_str(&format!("{:02X}", byte));
+            let _ = write!(encoded, "%{byte:02X}");
         }
     }
     encoded

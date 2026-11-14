@@ -1,3 +1,4 @@
+use std::fmt::Write;
 use std::sync::Arc;
 
 use anyhow::{anyhow, Context};
@@ -18,6 +19,7 @@ pub enum VtexRetailer {
 }
 
 impl VtexRetailer {
+    #[must_use]
     pub fn slug(&self) -> &'static str {
         match self {
             Self::PlazaVea => "plazavea",
@@ -26,6 +28,7 @@ impl VtexRetailer {
         }
     }
 
+    #[must_use]
     pub fn base_url(&self) -> &'static str {
         match self {
             Self::PlazaVea => "https://www.plazavea.com.pe",
@@ -355,7 +358,7 @@ fn parse_vtex_sku(
     let sellers = item.get("sellers").and_then(|v| v.as_array());
     let selected_seller = sellers.and_then(|arr| {
         arr.iter()
-            .find(|s| s.get("sellerDefault").and_then(|v| v.as_bool()) == Some(true))
+            .find(|s| s.get("sellerDefault").and_then(Value::as_bool) == Some(true))
             .or_else(|| arr.first())
     });
 
@@ -367,6 +370,7 @@ fn parse_vtex_sku(
             let selling_price = positive_f64(offer.get("Price"));
             let (card_price, card_program) =
                 extract_card_offer(offer, &sku_id, list_price, selling_price, retailer);
+            #[allow(clippy::cast_possible_truncation)]
             let available_qty = offer
                 .get("AvailableQuantity")
                 .and_then(|v| v.as_i64().or_else(|| v.as_f64().map(|f| f as i64)));
@@ -444,14 +448,15 @@ impl RetailerAdapter for VtexAdapter {
 
         let mut products = Vec::with_capacity(items.len());
         for elem in items {
+            let Some(product_id) = value_as_string(elem.get("productId")) else {
+                tracing::warn!(
+                    retailer = %self.retailer_slug(),
+                    "VTEX product object missing productId; skipping item"
+                );
+                continue;
+            };
             let raw_payload = serde_json::to_string(elem)?;
             let payload_hash = compute_payload_hash(&raw_payload);
-            let product_id = value_as_string(elem.get("productId")).ok_or_else(|| {
-                anyhow!(
-                    "VTEX product object missing productId (retailer={})",
-                    self.retailer_slug()
-                )
-            })?;
             let raw_name = normalize_opt_string(
                 elem.get("productName")
                     .or_else(|| elem.get("productTitle"))
@@ -516,7 +521,19 @@ impl RetailerAdapter for VtexAdapter {
         ctx: &FetchContext,
     ) -> anyhow::Result<PageBatch> {
         let effective_size = page_size.clamp(1, 50);
-        let url = self.build_page_url(category_or_query, offset, effective_size);
+        let mut url = self.build_page_url(category_or_query, offset, effective_size);
+        if let Some(ref pc) = ctx.postal_code {
+            if !url.contains("_postalCode=") {
+                let sep = if url.contains('?') { '&' } else { '?' };
+                let _ = write!(url, "{sep}_postalCode={}", encode_url_segment(pc));
+            }
+        }
+        if let Some(ref sid) = ctx.store_id {
+            if !url.contains("_storeId=") {
+                let sep = if url.contains('?') { '&' } else { '?' };
+                let _ = write!(url, "{sep}_storeId={}", encode_url_segment(sid));
+            }
+        }
         let resp = self.http.get_text(&url).await?;
         let page_ctx = ctx.clone().with_endpoint(url, resp.status);
         let products = self.parse_page_payload(&resp.body, &page_ctx)?;
@@ -711,7 +728,7 @@ mod tests {
         let adapter = VtexAdapter::new(VtexRetailer::Metro, test_http());
         let ctx = FetchContext::for_run(Uuid::new_v4(), "PE", None);
         let products = adapter.parse_page_payload("[]", &ctx).unwrap();
-        assert!(products.is_empty());
+        assert_eq!(products, [] as [Product; 0]);
     }
 
     #[test]
@@ -1022,6 +1039,81 @@ mod tests {
         assert_eq!(products[3].skus[0].ean.as_deref(), Some("17750151008669"));
         assert_eq!(products[4].skus[0].ean.as_deref(), Some("7751271034142"));
         assert_eq!(products[5].skus[0].ean, None);
+    }
+
+    #[tokio::test]
+    async fn vtex_fetch_page_appends_postal_code_and_store_id_to_endpoint() {
+        let body = r#"[{"productId":"1","productName":"Item 1","items":[{"itemId":"11","name":"Item 1","sellers":[]}]}]"#;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let (req_tx, mut req_rx) = tokio::sync::mpsc::channel::<String>(1);
+
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 2048];
+            let n = socket.read(&mut buf).await.unwrap();
+            let req_str = String::from_utf8_lossy(&buf[..n]).to_string();
+            let _ = req_tx.send(req_str).await;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = socket.write_all(resp.as_bytes()).await;
+        });
+
+        let adapter = VtexAdapter::with_base_url(
+            VtexRetailer::PlazaVea,
+            format!("http://{addr}"),
+            test_http(),
+        );
+        let mut ctx = FetchContext::for_run(Uuid::new_v4(), "PE", Some("15001".to_string()));
+        ctx.store_id = Some("TIENDA_1".to_string());
+        let batch = adapter.fetch_page("lacteos", 0, 20, &ctx).await.unwrap();
+        assert_eq!(batch.products.len(), 1);
+
+        let req = req_rx.recv().await.unwrap();
+        assert!(
+            req.contains("_postalCode=15001"),
+            "request missing _postalCode: {req}"
+        );
+        assert!(
+            req.contains("_storeId=TIENDA_1"),
+            "request missing _storeId: {req}"
+        );
+
+        let endpoint = &batch.products[0].source_endpoint;
+        assert!(
+            endpoint.contains("_postalCode=15001"),
+            "product endpoint missing _postalCode: {endpoint}"
+        );
+        assert!(
+            endpoint.contains("_storeId=TIENDA_1"),
+            "product endpoint missing _storeId: {endpoint}"
+        );
+    }
+
+    #[test]
+    fn vtex_skips_item_missing_product_id_and_parses_valid_items() {
+        let fixture = r#"[
+          {
+            "productName": "Invalid Product Without Id",
+            "items": []
+          },
+          {
+            "productId": "888",
+            "productName": "Valid Product",
+            "items": []
+          }
+        ]"#;
+
+        let adapter = VtexAdapter::new(VtexRetailer::PlazaVea, test_http());
+        let ctx = FetchContext::for_run(Uuid::new_v4(), "PE", None);
+        let products = adapter
+            .parse_page_payload(fixture, &ctx)
+            .expect("should succeed");
+        assert_eq!(products.len(), 1);
+        assert_eq!(products[0].product_id, "888");
     }
 
     #[test]

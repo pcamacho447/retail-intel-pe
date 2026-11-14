@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::fmt::Write;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -239,7 +240,7 @@ fn extract_next_data_json(body: &str, http_status: u16) -> anyhow::Result<Value>
 
     let marker = if let Some(pos) = body.find(r#"id="__NEXT_DATA__""#) {
         pos
-    } else if let Some(pos) = body.find(r#"id='__NEXT_DATA__'"#) {
+    } else if let Some(pos) = body.find(r"id='__NEXT_DATA__'") {
         pos
     } else {
         let snippet: String = body.chars().take(200).collect();
@@ -281,14 +282,34 @@ fn parse_price_value(raw: &Value) -> Option<f64> {
     }
 
     let s = scalar.as_str()?;
-    let cleaned: String = s
+    let segment = s.split('-').next().unwrap_or(s);
+    let first_digit_pos = segment.find(|ch: char| ch.is_ascii_digit())?;
+    let from_first_digit = &segment[first_digit_pos..];
+
+    let filtered: String = from_first_digit
         .chars()
-        .filter(|ch| ch.is_ascii_digit() || *ch == '.')
+        .filter(|ch| ch.is_ascii_digit() || *ch == '.' || *ch == ',')
         .collect();
-    if cleaned.is_empty() {
+
+    if filtered.is_empty() {
         return None;
     }
-    let parsed: f64 = cleaned.parse().ok()?;
+
+    let normalized = if filtered.contains('.') && filtered.contains(',') {
+        let last_dot = filtered.rfind('.').unwrap();
+        let last_comma = filtered.rfind(',').unwrap();
+        if last_dot > last_comma {
+            filtered.replace(',', "")
+        } else {
+            filtered.replace('.', "").replace(',', ".")
+        }
+    } else if filtered.contains(',') {
+        filtered.replace(',', ".")
+    } else {
+        filtered
+    };
+
+    let parsed: f64 = normalized.parse().ok()?;
     if parsed.is_finite() && parsed > 0.0 {
         Some(parsed)
     } else {
@@ -694,14 +715,15 @@ fn parse_results_from_root(
 
     let mut products = Vec::with_capacity(results.len());
     for item in results {
+        let Some(product_id) = value_as_string(item.get("productId")) else {
+            tracing::warn!(
+                http_status = ctx.http_status,
+                "Falabella/Tottus result item missing productId; skipping item"
+            );
+            continue;
+        };
         let raw_payload = serde_json::to_string(item)?;
         let payload_hash = compute_payload_hash(&raw_payload);
-        let product_id = value_as_string(item.get("productId")).ok_or_else(|| {
-            anyhow!(
-                "Falabella/Tottus result item missing productId (http_status={})",
-                ctx.http_status
-            )
-        })?;
         let sku_id = value_as_string(item.get("skuId")).unwrap_or_else(|| product_id.clone());
         let raw_name = normalize_opt_string(
             item.get("displayName")
@@ -775,13 +797,13 @@ fn has_more_pages(root: &Value, products_len: usize, page_size: usize) -> bool {
     }
 
     if let Some(pagination) = root.pointer("/props/pageProps/pagination") {
-        let current_page = pagination.get("currentPage").and_then(|v| v.as_u64());
-        let total_pages = pagination.get("totalPages").and_then(|v| v.as_u64());
+        let current_page = pagination.get("currentPage").and_then(Value::as_u64);
+        let total_pages = pagination.get("totalPages").and_then(Value::as_u64);
         if let (Some(curr), Some(total)) = (current_page, total_pages) {
             return curr < total;
         }
-        let count = pagination.get("count").and_then(|v| v.as_u64());
-        let per_page = pagination.get("perPage").and_then(|v| v.as_u64());
+        let count = pagination.get("count").and_then(Value::as_u64);
+        let per_page = pagination.get("perPage").and_then(Value::as_u64);
         if let (Some(curr), Some(per), Some(total_count)) = (current_page, per_page, count) {
             return curr.saturating_mul(per) < total_count;
         }
@@ -829,7 +851,19 @@ impl RetailerAdapter for FalabellaListingAdapter {
         page_size: usize,
         ctx: &FetchContext,
     ) -> anyhow::Result<PageBatch> {
-        let url = self.build_page_url(category_or_query, offset, page_size);
+        let mut url = self.build_page_url(category_or_query, offset, page_size);
+        if let Some(ref pc) = ctx.postal_code {
+            if !url.contains("postalCode=") {
+                let sep = if url.contains('?') { '&' } else { '?' };
+                let _ = write!(url, "{sep}postalCode={}", encode_url_segment(pc));
+            }
+        }
+        if let Some(ref sid) = ctx.store_id {
+            if !url.contains("storeId=") {
+                let sep = if url.contains('?') { '&' } else { '?' };
+                let _ = write!(url, "{sep}storeId={}", encode_url_segment(sid));
+            }
+        }
         let resp = self.http.get_text(&url).await?;
         let page_ctx = ctx.clone().with_endpoint(url, resp.status);
         let root = extract_next_data_json(&resp.body, resp.status)?;
@@ -1189,6 +1223,114 @@ mod tests {
             extract_tottus_listing_stock(&with_max_cart, Some(4.5)),
             Some(12)
         );
+    }
+
+    #[tokio::test]
+    async fn falabella_fetch_page_appends_postal_code_and_store_id_to_endpoint() {
+        let body = r#"<html><script id="__NEXT_DATA__" type="application/json">{
+          "props": {
+            "pageProps": {
+              "pagination": {"count": 1, "perPage": 20, "currentPage": 1, "totalPages": 1},
+              "results": [
+                {"productId": "10", "skuId": "10", "displayName": "Producto 10", "prices": []}
+              ]
+            }
+          }
+        }</script></html>"#;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let (req_tx, mut req_rx) = tokio::sync::mpsc::channel::<String>(1);
+
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 2048];
+            let n = socket.read(&mut buf).await.unwrap();
+            let req_str = String::from_utf8_lossy(&buf[..n]).to_string();
+            let _ = req_tx.send(req_str).await;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = socket.write_all(resp.as_bytes()).await;
+        });
+
+        let adapter = FalabellaListingAdapter::with_base_url(format!("http://{addr}"), test_http());
+        let mut ctx = FetchContext::for_run(Uuid::new_v4(), "PE", Some("15001".to_string()));
+        ctx.store_id = Some("TIENDA_1".to_string());
+        let batch = adapter.fetch_page("leche", 0, 20, &ctx).await.unwrap();
+        assert_eq!(batch.products.len(), 1);
+
+        let req = req_rx.recv().await.unwrap();
+        assert!(
+            req.contains("postalCode=15001"),
+            "request missing postalCode: {req}"
+        );
+        assert!(
+            req.contains("storeId=TIENDA_1"),
+            "request missing storeId: {req}"
+        );
+
+        let endpoint = &batch.products[0].source_endpoint;
+        assert!(
+            endpoint.contains("postalCode=15001"),
+            "product endpoint missing postalCode: {endpoint}"
+        );
+        assert!(
+            endpoint.contains("storeId=TIENDA_1"),
+            "product endpoint missing storeId: {endpoint}"
+        );
+    }
+
+    #[test]
+    fn falabella_parse_price_handles_peruvian_currency_prefixes_commas_and_ranges() {
+        assert_eq!(
+            parse_price_value(&serde_json::json!("S/. 4.50")),
+            Some(4.50)
+        );
+        assert_eq!(parse_price_value(&serde_json::json!("S/ 4,50")), Some(4.50));
+        assert_eq!(
+            parse_price_value(&serde_json::json!("S/ 1,299.90")),
+            Some(1299.90)
+        );
+        assert_eq!(
+            parse_price_value(&serde_json::json!("S/ 1.299,90")),
+            Some(1299.90)
+        );
+        assert_eq!(
+            parse_price_value(&serde_json::json!("S/ 4.50 - S/ 6.00")),
+            Some(4.50)
+        );
+    }
+
+    #[test]
+    fn falabella_skips_item_missing_product_id_and_parses_valid_items() {
+        let json = r#"{
+          "props": {
+            "pageProps": {
+              "results": [
+                {
+                  "displayName": "Item without productId",
+                  "prices": []
+                },
+                {
+                  "productId": "999",
+                  "displayName": "Valid Product",
+                  "prices": []
+                }
+              ]
+            }
+          }
+        }"#;
+
+        let adapter = FalabellaListingAdapter::new_tottus(test_http());
+        let ctx = FetchContext::for_run(Uuid::new_v4(), "PE", None);
+        let products = adapter
+            .parse_page_payload(json, &ctx)
+            .expect("should succeed");
+        assert_eq!(products.len(), 1);
+        assert_eq!(products[0].product_id, "999");
     }
 
     #[test]

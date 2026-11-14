@@ -62,27 +62,41 @@ pub async fn run_ingest(
 
         if config.resume {
             if let Some(cp) = checkpoints.load(slug, category)? {
-                if cp.completed {
+                let check_ps = cp.page_size.unwrap_or(config.page_size);
+                if cp.is_valid_for_run(category, run_date, check_ps) {
+                    if cp.completed {
+                        tracing::info!(
+                            retailer = slug,
+                            category = %category,
+                            "Skipping already completed category from checkpoint"
+                        );
+                        continue;
+                    }
+                    offset = cp.next_offset;
+                    pages_completed_total = cp.pages_completed;
+                    if let Some(saved_ps) = cp.page_size.filter(|&ps| ps > 0) {
+                        effective_page_size = saved_ps;
+                    }
                     tracing::info!(
                         retailer = slug,
                         category = %category,
-                        "Skipping already completed category from checkpoint"
+                        offset = offset,
+                        pages_completed = pages_completed_total,
+                        page_size = effective_page_size,
+                        "Resuming category from checkpoint"
                     );
-                    continue;
+                } else {
+                    tracing::info!(
+                        retailer = slug,
+                        category = %category,
+                        checkpoint_date = %cp.updated_at.date_naive(),
+                        run_date = %run_date,
+                        checkpoint_page_size = ?cp.page_size,
+                        run_page_size = config.page_size,
+                        checkpoint_category = %cp.category,
+                        "Ignoring stale or mismatched checkpoint"
+                    );
                 }
-                offset = cp.next_offset;
-                pages_completed_total = cp.pages_completed;
-                if let Some(saved_ps) = cp.page_size.filter(|&ps| ps > 0) {
-                    effective_page_size = saved_ps;
-                }
-                tracing::info!(
-                    retailer = slug,
-                    category = %category,
-                    offset = offset,
-                    pages_completed = pages_completed_total,
-                    page_size = effective_page_size,
-                    "Resuming category from checkpoint"
-                );
             }
         }
 
@@ -102,6 +116,9 @@ pub async fn run_ingest(
 
                     for product in &batch.products {
                         products_recovered += 1;
+                        if product.skus.is_empty() {
+                            continue;
+                        }
                         let is_dup = dedup.check_and_mark(&product.payload_hash);
                         if is_dup {
                             duplicates_detected += 1;
@@ -583,5 +600,72 @@ mod tests {
         assert_eq!(lacteos_cp.page_size, Some(10));
         let abarrotes_cp = store.load("metro", "abarrotes").unwrap().unwrap();
         assert_eq!(abarrotes_cp.page_size, Some(25));
+    }
+
+    #[tokio::test]
+    async fn run_ingest_resume_ignores_stale_previous_day_checkpoint() {
+        let dir = TempDir::new().unwrap();
+        let store = CheckpointStore::new(dir.path());
+        let yesterday = Utc::now() - chrono::Duration::days(1);
+        store
+            .save(&CheckpointState {
+                retailer: "metro".to_string(),
+                category: "lacteos".to_string(),
+                next_offset: 20,
+                pages_completed: 1,
+                extraction_run_id: Uuid::new_v4(),
+                updated_at: yesterday,
+                completed: true,
+                page_size: Some(20),
+            })
+            .unwrap();
+
+        let page_json = r#"[{"productId":"100","productName":"Leche Fresca","items":[{"itemId":"1001","ean":"7751234567890","name":"Leche Fresca","sellers":[]}]}]"#;
+        let (base_url, calls) = spawn_vtex_sequence(vec![(200, page_json.to_string())]).await;
+
+        let http = fast_http();
+        let adapter = VtexAdapter::with_base_url(VtexRetailer::Metro, &base_url, http.clone());
+        let cfg = IngestConfig {
+            retailer: "metro".to_string(),
+            categories: vec!["lacteos".to_string()],
+            page_size: 20,
+            max_pages: 1,
+            output_dir: dir.path().to_path_buf(),
+            resume: true,
+            market_id: "PE".to_string(),
+            postal_code: None,
+        };
+
+        let metrics = run_ingest(&adapter, &http, &cfg).await.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(metrics.pages_fetched, 1);
+        assert_eq!(metrics.products_recovered, 1);
+    }
+
+    #[tokio::test]
+    async fn run_ingest_does_not_mark_hash_when_product_has_zero_skus() {
+        let dir = TempDir::new().unwrap();
+        let zero_sku_json = r#"[{"productId":"999","productName":"Zero SKU Product","items":[]}]"#;
+        let (base_url, _) = spawn_vtex_sequence(vec![(200, zero_sku_json.to_string())]).await;
+
+        let http = fast_http();
+        let adapter = VtexAdapter::with_base_url(VtexRetailer::PlazaVea, &base_url, http.clone());
+        let cfg = IngestConfig {
+            retailer: "plazavea".to_string(),
+            categories: vec!["lacteos".to_string()],
+            page_size: 20,
+            max_pages: 1,
+            output_dir: dir.path().to_path_buf(),
+            resume: false,
+            market_id: "PE".to_string(),
+            postal_code: None,
+        };
+
+        let metrics = run_ingest(&adapter, &http, &cfg).await.unwrap();
+        assert_eq!(metrics.products_recovered, 1);
+        assert_eq!(metrics.skus_recovered, 0);
+
+        let dedup = PayloadDeduplicator::open(dir.path()).unwrap();
+        assert_eq!(dedup.len(), 0);
     }
 }

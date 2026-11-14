@@ -73,6 +73,7 @@ pub struct BronzeSkuRow {
     pub raw_payload: Option<String>,
 }
 
+#[must_use]
 pub fn normalize_opt_string(s: Option<&str>) -> Option<String> {
     s.map(str::trim)
         .filter(|trimmed| !trimmed.is_empty())
@@ -118,6 +119,7 @@ impl Product {
     /// Expands this `Product` (1) into `N` `BronzeSkuRow` records (one per `SkuItem`).
     /// When `is_duplicate_payload` is true, `raw_payload` is omitted (`None`) to avoid
     /// storing duplicate JSON payloads across Bronze partitions.
+    #[must_use]
     pub fn to_bronze_rows(&self, is_duplicate_payload: bool) -> Vec<BronzeSkuRow> {
         if self.skus.is_empty() {
             tracing::warn!(
@@ -340,6 +342,6 @@ mod tests {
     fn product_to_bronze_rows_handles_empty_skus_gracefully() {
         let product = sample_product(vec![]);
         let rows = product.to_bronze_rows(false);
-        assert!(rows.is_empty());
+        assert_eq!(rows, [] as [BronzeSkuRow; 0]);
     }
 }
