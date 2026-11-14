@@ -356,7 +356,19 @@ impl RetailerAdapter for VtexAdapter {
         ctx: &FetchContext,
     ) -> anyhow::Result<PageBatch> {
         let effective_size = page_size.clamp(1, 50);
-        let url = self.build_page_url(category_or_query, offset, effective_size);
+        let mut url = self.build_page_url(category_or_query, offset, effective_size);
+        if let Some(ref pc) = ctx.postal_code {
+            if !url.contains("_postalCode=") {
+                let sep = if url.contains('?') { '&' } else { '?' };
+                url.push_str(&format!("{sep}_postalCode={}", encode_url_segment(pc)));
+            }
+        }
+        if let Some(ref sid) = ctx.store_id {
+            if !url.contains("_storeId=") {
+                let sep = if url.contains('?') { '&' } else { '?' };
+                url.push_str(&format!("{sep}_storeId={}", encode_url_segment(sid)));
+            }
+        }
         let resp = self.http.get_text(&url).await?;
         let page_ctx = ctx.clone().with_endpoint(url, resp.status);
         let products = self.parse_page_payload(&resp.body, &page_ctx)?;
@@ -729,5 +741,45 @@ mod tests {
         assert_eq!(batch.products.len(), 1);
         assert!(!batch.has_more);
         assert_eq!(batch.next_offset, 1);
+    }
+
+    #[tokio::test]
+    async fn vtex_fetch_page_appends_postal_code_and_store_id_to_endpoint() {
+        let body = r#"[{"productId":"1","productName":"Item 1","items":[{"itemId":"11","name":"Item 1","sellers":[]}]}]"#;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let (req_tx, mut req_rx) = tokio::sync::mpsc::channel::<String>(1);
+
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 2048];
+            let n = socket.read(&mut buf).await.unwrap();
+            let req_str = String::from_utf8_lossy(&buf[..n]).to_string();
+            let _ = req_tx.send(req_str).await;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = socket.write_all(resp.as_bytes()).await;
+        });
+
+        let adapter = VtexAdapter::with_base_url(
+            VtexRetailer::PlazaVea,
+            format!("http://{addr}"),
+            test_http(),
+        );
+        let mut ctx = FetchContext::for_run(Uuid::new_v4(), "PE", Some("15001".to_string()));
+        ctx.store_id = Some("TIENDA_1".to_string());
+        let batch = adapter.fetch_page("lacteos", 0, 20, &ctx).await.unwrap();
+        assert_eq!(batch.products.len(), 1);
+
+        let req = req_rx.recv().await.unwrap();
+        assert!(req.contains("_postalCode=15001"), "request missing _postalCode: {req}");
+        assert!(req.contains("_storeId=TIENDA_1"), "request missing _storeId: {req}");
+
+        let endpoint = &batch.products[0].source_endpoint;
+        assert!(endpoint.contains("_postalCode=15001"), "product endpoint missing _postalCode: {endpoint}");
+        assert!(endpoint.contains("_storeId=TIENDA_1"), "product endpoint missing _storeId: {endpoint}");
     }
 }

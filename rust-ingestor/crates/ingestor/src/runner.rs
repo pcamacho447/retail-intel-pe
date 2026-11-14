@@ -110,6 +110,9 @@ pub async fn run_ingest(
 
                     for product in &batch.products {
                         products_recovered += 1;
+                        if product.skus.is_empty() {
+                            continue;
+                        }
                         let is_dup = dedup.check_and_mark(&product.payload_hash);
                         if is_dup {
                             duplicates_detected += 1;
@@ -545,5 +548,32 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert_eq!(metrics.pages_fetched, 1);
         assert_eq!(metrics.products_recovered, 1);
+    }
+
+    #[tokio::test]
+    async fn run_ingest_does_not_mark_hash_when_product_has_zero_skus() {
+        let dir = TempDir::new().unwrap();
+        let zero_sku_json = r#"[{"productId":"999","productName":"Zero SKU Product","items":[]}]"#;
+        let (base_url, _) = spawn_vtex_sequence(vec![(200, zero_sku_json.to_string())]).await;
+
+        let http = fast_http();
+        let adapter = VtexAdapter::with_base_url(VtexRetailer::PlazaVea, &base_url, http.clone());
+        let cfg = IngestConfig {
+            retailer: "plazavea".to_string(),
+            categories: vec!["lacteos".to_string()],
+            page_size: 20,
+            max_pages: 1,
+            output_dir: dir.path().to_path_buf(),
+            resume: false,
+            market_id: "PE".to_string(),
+            postal_code: None,
+        };
+
+        let metrics = run_ingest(&adapter, &http, &cfg).await.unwrap();
+        assert_eq!(metrics.products_recovered, 1);
+        assert_eq!(metrics.skus_recovered, 0);
+
+        let dedup = PayloadDeduplicator::open(dir.path()).unwrap();
+        assert_eq!(dedup.len(), 0);
     }
 }

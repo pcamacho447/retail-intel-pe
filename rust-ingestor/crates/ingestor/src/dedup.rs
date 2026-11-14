@@ -48,7 +48,26 @@ impl PayloadDeduplicator {
     }
 
     /// Atomically persists all seen hashes to `<bronze_dir>/blobs/seen_hashes.json`.
-    pub fn persist(&self) -> anyhow::Result<()> {
+    /// Merges existing hashes on disk (if any) with in-memory seen hashes before writing.
+    pub fn persist(&mut self) -> anyhow::Result<()> {
+        if self.index_path.exists() {
+            let bytes = match fs::read(&self.index_path) {
+                Ok(b) => Some(b),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+                Err(err) => {
+                    return Err(err).with_context(|| {
+                        format!("failed to read dedup index at {}", self.index_path.display())
+                    })
+                }
+            };
+            if let Some(bytes) = bytes {
+                let parsed: SeenHashesFile = serde_json::from_slice(&bytes).with_context(|| {
+                    format!("failed to parse dedup index at {}", self.index_path.display())
+                })?;
+                self.seen.extend(parsed.seen_hashes);
+            }
+        }
+
         let mut hashes: Vec<String> = self.seen.iter().cloned().collect();
         hashes.sort();
         let payload = serde_json::to_vec_pretty(&SeenHashesFile {
@@ -63,6 +82,10 @@ impl PayloadDeduplicator {
 
     pub fn is_empty(&self) -> bool {
         self.seen.is_empty()
+    }
+
+    pub fn contains(&self, payload_hash: &str) -> bool {
+        self.seen.contains(payload_hash)
     }
 }
 
@@ -111,5 +134,24 @@ mod tests {
 
         let dedup_run3 = PayloadDeduplicator::open(dir.path()).unwrap();
         assert_eq!(dedup_run3.len(), 3);
+    }
+
+    #[test]
+    fn deduplicator_persist_merges_concurrent_writes_without_data_loss() {
+        let dir = TempDir::new().unwrap();
+
+        let mut dedup_a = PayloadDeduplicator::open(dir.path()).unwrap();
+        let mut dedup_b = PayloadDeduplicator::open(dir.path()).unwrap();
+
+        assert!(!dedup_a.check_and_mark("hash_a"));
+        dedup_a.persist().unwrap();
+
+        assert!(!dedup_b.check_and_mark("hash_b"));
+        dedup_b.persist().unwrap();
+
+        let dedup_c = PayloadDeduplicator::open(dir.path()).unwrap();
+        assert_eq!(dedup_c.len(), 2);
+        assert!(dedup_c.contains("hash_a"));
+        assert!(dedup_c.contains("hash_b"));
     }
 }
