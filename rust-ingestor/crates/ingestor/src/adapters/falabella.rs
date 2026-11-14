@@ -17,6 +17,7 @@ use crate::domain::{normalize_opt_string, validate_gtin_mod10, Product, SkuItem}
 use crate::http::RateLimitedHttpClient;
 
 const TOTTUS_BASE_URL: &str = "https://tottus.falabella.com.pe";
+pub const TOTTUS_CACHE_SOURCE_PDP: &str = "tottus_pdp_ssr";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TottusCacheEntry {
@@ -94,6 +95,7 @@ impl TottusPdpCache {
     pub fn record_pdp_enrichment(&mut self, sku_id: &str, enrichment: &TottusPdpEnrichment) {
         let existing = self.entries.get(sku_id);
         let existing_valid_ean = existing
+            .filter(|e| e.source == TOTTUS_CACHE_SOURCE_PDP)
             .and_then(|e| e.ean.as_deref())
             .and_then(validate_gtin_mod10);
         let merged_ean = enrichment
@@ -114,7 +116,7 @@ impl TottusPdpCache {
                 .seller_sku_id
                 .clone()
                 .or_else(|| existing.and_then(|e| e.seller_sku_id.clone())),
-            source: "tottus_pdp_ssr".to_string(),
+            source: TOTTUS_CACHE_SOURCE_PDP.to_string(),
             pdp_checked: true,
             updated_at: Utc::now(),
         };
@@ -198,9 +200,14 @@ impl FalabellaListingAdapter {
         for product in products.iter_mut() {
             for sku in &mut product.skus {
                 let cache_entry = cache.get(&sku.sku_id);
-                if let Some(entry) = cache_entry {
+                if let Some(entry) =
+                    cache_entry.filter(|entry| entry.source == TOTTUS_CACHE_SOURCE_PDP)
+                {
                     if sku.ean.is_none() {
-                        sku.ean = entry.ean.as_deref().and_then(validate_gtin_mod10);
+                        if let Some(ean) = entry.ean.as_deref().and_then(validate_gtin_mod10) {
+                            sku.ean = Some(ean);
+                            sku.ean_source = Some("pdp".to_string());
+                        }
                     }
                     if sku.available_qty != Some(0) {
                         if let Some(qty) = entry.available_qty {
@@ -211,7 +218,8 @@ impl FalabellaListingAdapter {
 
                 if self.enrich_pdp
                     && sku.ean.is_none()
-                    && cache_entry.is_none_or(|e| !e.pdp_checked)
+                    && cache_entry
+                        .is_none_or(|e| !e.pdp_checked || e.source != TOTTUS_CACHE_SOURCE_PDP)
                 {
                     if let Some(url) = product.product_url.as_ref() {
                         if queued_skus.insert(sku.sku_id.clone()) {
@@ -731,6 +739,7 @@ fn parse_results_from_root(
         );
         let (list_price, selling_price, card_price, card_program) = extract_falabella_prices(item);
         let ean = extract_tottus_listing_ean(item);
+        let ean_source = ean.as_ref().map(|_| "listing".to_string());
         let available_qty = extract_tottus_listing_stock(item, selling_price);
 
         products.push(Product {
@@ -758,7 +767,7 @@ fn parse_results_from_root(
             skus: vec![SkuItem {
                 sku_id,
                 ean,
-                ean_source: None,
+                ean_source,
                 availability_status: "unknown".to_string(),
                 availability_source: "none".to_string(),
                 seller_id,
@@ -894,7 +903,12 @@ impl RetailerAdapter for FalabellaListingAdapter {
                     for sku in &mut product.skus {
                         if let Some(enrichment) = fetched.get(&sku.sku_id) {
                             if sku.ean.is_none() {
-                                sku.ean = enrichment.ean.as_deref().and_then(validate_gtin_mod10);
+                                if let Some(ean) =
+                                    enrichment.ean.as_deref().and_then(validate_gtin_mod10)
+                                {
+                                    sku.ean = Some(ean);
+                                    sku.ean_source = Some("pdp".to_string());
+                                }
                             }
                             if let Some(qty) = enrichment.available_qty {
                                 sku.available_qty = Some(qty);
@@ -1266,6 +1280,18 @@ mod tests {
             "gtin": "null"
         });
         assert_eq!(extract_tottus_listing_ean(&invalid_only), None);
+
+        let adapter = FalabellaListingAdapter::new_tottus(test_http());
+        let ctx = FetchContext::for_run(Uuid::new_v4(), "PE", None);
+        let listing_payload = r#"{"props":{"pageProps":{"results":[
+          {"productId":"P1","skuId":"S1","displayName":"Leche Con EAN","gtin13":"7751271034142","prices":[]},
+          {"productId":"P2","skuId":"S2","displayName":"Leche Sin EAN","prices":[]}
+        ]}}}"#;
+        let products = adapter.parse_page_payload(listing_payload, &ctx).unwrap();
+        assert_eq!(products[0].skus[0].ean.as_deref(), Some("7751271034142"));
+        assert_eq!(products[0].skus[0].ean_source.as_deref(), Some("listing"));
+        assert_eq!(products[1].skus[0].ean, None);
+        assert_eq!(products[1].skus[0].ean_source, None);
     }
 
     #[test]
@@ -1471,8 +1497,8 @@ mod tests {
                 available_qty: None,
                 in_stock: None,
                 seller_sku_id: None,
-                source: "vtex_crossref_gtin13_seed".to_string(),
-                pdp_checked: false,
+                source: "tottus_pdp_ssr".to_string(),
+                pdp_checked: true,
                 updated_at: chrono::Utc::now(),
             },
         );
@@ -1491,6 +1517,7 @@ mod tests {
         let reloaded = TottusPdpCache::load(&cache_path).unwrap();
         let entry = reloaded.get("129087925").unwrap();
         assert_eq!(entry.ean.as_deref(), Some("7751271034098"));
+        assert_eq!(entry.source, "tottus_pdp_ssr");
         assert_eq!(entry.available_qty, Some(24));
         assert_eq!(entry.in_stock, Some(true));
         assert_eq!(entry.seller_sku_id.as_deref(), Some("SELL-129"));
@@ -1558,6 +1585,7 @@ mod tests {
         }</script></body></html>"#
             .to_string();
 
+        let pdp_1001_body = "<html></html>".to_string();
         let pdp_1002_body = r#"<!doctype html><html><head>
         <script type="application/ld+json">{
           "@type": "Product",
@@ -1587,7 +1615,8 @@ mod tests {
         }</script></body></html>"#
             .to_string();
 
-        let expected_batch1_bytes = listing_body.len() + pdp_1002_body.len() + pdp_1003_body.len();
+        let expected_batch1_bytes =
+            listing_body.len() + pdp_1001_body.len() + pdp_1002_body.len() + pdp_1003_body.len();
         let expected_listing_bytes = listing_body.len();
 
         let search_hits = Arc::new(AtomicUsize::new(0));
@@ -1609,6 +1638,7 @@ mod tests {
                     break;
                 };
                 let listing_body = listing_body.clone();
+                let pdp_1001_body = pdp_1001_body.clone();
                 let pdp_1002_body = pdp_1002_body.clone();
                 let pdp_1003_body = pdp_1003_body.clone();
                 let search_hits_srv = search_hits_srv.clone();
@@ -1631,7 +1661,7 @@ mod tests {
                         (200, "OK", listing_body)
                     } else if path.contains("/1001") {
                         pdp_1001_hits_srv.fetch_add(1, Ordering::SeqCst);
-                        (200, "OK", "<html></html>".to_string())
+                        (200, "OK", pdp_1001_body)
                     } else if path.contains("/1002") {
                         pdp_1002_hits_srv.fetch_add(1, Ordering::SeqCst);
                         (200, "OK", pdp_1002_body)
@@ -1659,22 +1689,21 @@ mod tests {
         );
         let ctx = FetchContext::for_run(Uuid::new_v4(), "PE", None);
 
-        // First fetch: 1 listing + 2 uncached PDPs (1002 and 1003), 0 PDP for pre-seeded 1001.
+        // First fetch: 1 listing + 3 PDPs (seeded 1001 IS queried because seed is not verified PDP).
         let batch1 = adapter.fetch_page("leche", 0, 20, &ctx).await.unwrap();
         assert_eq!(batch1.products.len(), 3);
         assert_eq!(batch1.raw_bytes, expected_batch1_bytes);
         assert_eq!(search_hits.load(Ordering::SeqCst), 1);
-        assert_eq!(pdp_1001_hits.load(Ordering::SeqCst), 0);
+        assert_eq!(pdp_1001_hits.load(Ordering::SeqCst), 1);
         assert_eq!(pdp_1002_hits.load(Ordering::SeqCst), 1);
         assert_eq!(pdp_1003_hits.load(Ordering::SeqCst), 1);
 
-        assert_eq!(
-            batch1.products[0].skus[0].ean.as_deref(),
-            Some("7751271034098")
-        );
+        assert_eq!(batch1.products[0].skus[0].ean, None);
+        assert_eq!(batch1.products[0].skus[0].ean_source, None);
         assert_eq!(batch1.products[0].skus[0].available_qty, Some(1));
 
         assert_eq!(batch1.products[1].skus[0].ean, None);
+        assert_eq!(batch1.products[1].skus[0].ean_source, None);
         assert_eq!(batch1.products[1].skus[0].available_qty, Some(24));
         assert_eq!(
             batch1.products[1].skus[0].card_program.as_deref(),
@@ -1685,18 +1714,22 @@ mod tests {
             batch1.products[2].skus[0].ean.as_deref(),
             Some("7751271034142")
         );
+        assert_eq!(
+            batch1.products[2].skus[0].ean_source.as_deref(),
+            Some("pdp")
+        );
         assert_eq!(batch1.products[2].skus[0].available_qty, Some(0));
 
-        // Verify persisted cache contents
+        // Verify persisted cache contents: seeded 1001 was overwritten as pdp_checked with ean: None.
         let saved_cache = TottusPdpCache::load(&cache_path).unwrap();
-        assert_eq!(
-            saved_cache.get("1001").and_then(|e| e.ean.as_deref()),
-            Some("7751271034098")
-        );
+        assert!(saved_cache
+            .get("1001")
+            .is_some_and(|e| e.pdp_checked && e.source == "tottus_pdp_ssr" && e.ean.is_none()));
         assert!(saved_cache
             .get("1002")
             .is_some_and(|e| e.pdp_checked && e.ean.is_none() && e.available_qty == Some(24)));
         assert!(saved_cache.get("1003").is_some_and(|e| e.pdp_checked
+            && e.source == "tottus_pdp_ssr"
             && e.ean.as_deref() == Some("7751271034142")
             && e.available_qty == Some(0)));
 
@@ -1704,22 +1737,24 @@ mod tests {
         let batch2 = adapter.fetch_page("leche", 0, 20, &ctx).await.unwrap();
         assert_eq!(batch2.raw_bytes, expected_listing_bytes);
         assert_eq!(search_hits.load(Ordering::SeqCst), 2);
-        assert_eq!(pdp_1001_hits.load(Ordering::SeqCst), 0);
+        assert_eq!(pdp_1001_hits.load(Ordering::SeqCst), 1);
         assert_eq!(pdp_1002_hits.load(Ordering::SeqCst), 1);
         assert_eq!(pdp_1003_hits.load(Ordering::SeqCst), 1);
 
-        assert_eq!(
-            batch2.products[0].skus[0].ean.as_deref(),
-            Some("7751271034098")
-        );
+        assert_eq!(batch2.products[0].skus[0].ean, None);
+        assert_eq!(batch2.products[0].skus[0].ean_source, None);
         assert_eq!(batch2.products[1].skus[0].available_qty, Some(24));
         assert_eq!(
             batch2.products[2].skus[0].ean.as_deref(),
             Some("7751271034142")
         );
+        assert_eq!(
+            batch2.products[2].skus[0].ean_source.as_deref(),
+            Some("pdp")
+        );
         assert_eq!(batch2.products[2].skus[0].available_qty, Some(0));
 
-        // Cache-only mode (enrich_pdp = false) still enriches from persisted cache with zero PDP hits.
+        // Cache-only mode (enrich_pdp = false) still enriches from verified PDP cache with zero PDP hits.
         let cache_only_adapter = FalabellaListingAdapter::with_enrichment(
             format!("http://{addr}"),
             test_http(),
@@ -1732,17 +1767,19 @@ mod tests {
             .unwrap();
         assert_eq!(batch3.raw_bytes, expected_listing_bytes);
         assert_eq!(search_hits.load(Ordering::SeqCst), 3);
-        assert_eq!(pdp_1001_hits.load(Ordering::SeqCst), 0);
+        assert_eq!(pdp_1001_hits.load(Ordering::SeqCst), 1);
         assert_eq!(pdp_1002_hits.load(Ordering::SeqCst), 1);
         assert_eq!(pdp_1003_hits.load(Ordering::SeqCst), 1);
-        assert_eq!(
-            batch3.products[0].skus[0].ean.as_deref(),
-            Some("7751271034098")
-        );
+        assert_eq!(batch3.products[0].skus[0].ean, None);
+        assert_eq!(batch3.products[0].skus[0].ean_source, None);
         assert_eq!(batch3.products[1].skus[0].available_qty, Some(24));
         assert_eq!(
             batch3.products[2].skus[0].ean.as_deref(),
             Some("7751271034142")
+        );
+        assert_eq!(
+            batch3.products[2].skus[0].ean_source.as_deref(),
+            Some("pdp")
         );
         assert_eq!(batch3.products[2].skus[0].available_qty, Some(0));
     }
@@ -1870,5 +1907,168 @@ mod tests {
         assert!(
             base == "nogit" || (base.len() == 7 && base.chars().all(|c| c.is_ascii_hexdigit()))
         );
+    }
+
+    async fn spawn_listing_server(listing_body: String) -> std::net::SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let body = listing_body.clone();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let _ = socket.read(&mut buf).await;
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = socket.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn falabella_seeded_cache_ean_never_reaches_bronze() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let cache_path = dir.path().join("tottus_ean_cache.json");
+
+        let mut cache_map = std::collections::BTreeMap::new();
+        cache_map.insert(
+            "S1".to_string(),
+            TottusCacheEntry {
+                ean: Some("7751271031103".to_string()),
+                available_qty: None,
+                in_stock: None,
+                seller_sku_id: None,
+                source: "vtex_crossref_gtin13_seed".to_string(),
+                pdp_checked: false,
+                updated_at: chrono::Utc::now(),
+            },
+        );
+        std::fs::write(&cache_path, serde_json::to_vec_pretty(&cache_map).unwrap()).unwrap();
+
+        let listing_body = r#"{"props":{"pageProps":{"results":[{"productId":"P1","skuId":"S1","displayName":"Leche Sin EAN","url":"/tottus-pe/product/P1/leche/S1","prices":[]}]}}}"#.to_string();
+        let addr = spawn_listing_server(listing_body).await;
+        let adapter = FalabellaListingAdapter::with_enrichment(
+            format!("http://{addr}"),
+            test_http(),
+            false,
+            Some(cache_path),
+        );
+        let ctx = FetchContext::for_run(Uuid::new_v4(), "PE", None);
+        let batch = adapter.fetch_page("leche", 0, 20, &ctx).await.unwrap();
+        let sku = &batch.products[0].skus[0];
+        assert_eq!(sku.ean, None);
+        assert_eq!(sku.ean_source, None);
+    }
+
+    #[tokio::test]
+    async fn falabella_pdp_cache_ean_sets_source_pdp() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let cache_path = dir.path().join("tottus_ean_cache.json");
+
+        let mut cache_map = std::collections::BTreeMap::new();
+        cache_map.insert(
+            "S1".to_string(),
+            TottusCacheEntry {
+                ean: Some("7751271031103".to_string()),
+                available_qty: None,
+                in_stock: None,
+                seller_sku_id: None,
+                source: "tottus_pdp_ssr".to_string(),
+                pdp_checked: true,
+                updated_at: chrono::Utc::now(),
+            },
+        );
+        std::fs::write(&cache_path, serde_json::to_vec_pretty(&cache_map).unwrap()).unwrap();
+
+        let listing_body = r#"{"props":{"pageProps":{"results":[{"productId":"P1","skuId":"S1","displayName":"Leche Con Cache PDP","url":"/tottus-pe/product/P1/leche/S1","prices":[]}]}}}"#.to_string();
+        let addr = spawn_listing_server(listing_body).await;
+        let adapter = FalabellaListingAdapter::with_enrichment(
+            format!("http://{addr}"),
+            test_http(),
+            false,
+            Some(cache_path),
+        );
+        let ctx = FetchContext::for_run(Uuid::new_v4(), "PE", None);
+        let batch = adapter.fetch_page("leche", 0, 20, &ctx).await.unwrap();
+        let sku = &batch.products[0].skus[0];
+        assert_eq!(sku.ean.as_deref(), Some("7751271031103"));
+        assert_eq!(sku.ean_source.as_deref(), Some("pdp"));
+    }
+
+    #[test]
+    fn record_pdp_enrichment_does_not_launder_seed_ean() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let cache_path = dir.path().join("tottus_ean_cache.json");
+
+        let mut initial = std::collections::BTreeMap::new();
+        initial.insert(
+            "S1".to_string(),
+            TottusCacheEntry {
+                ean: Some("7751271031103".to_string()),
+                available_qty: None,
+                in_stock: None,
+                seller_sku_id: None,
+                source: "vtex_crossref_gtin13_seed".to_string(),
+                pdp_checked: false,
+                updated_at: chrono::Utc::now(),
+            },
+        );
+        std::fs::write(&cache_path, serde_json::to_vec_pretty(&initial).unwrap()).unwrap();
+
+        let mut cache = TottusPdpCache::load(&cache_path).unwrap();
+        let enrichment = TottusPdpEnrichment {
+            ean: None,
+            available_qty: Some(12),
+            in_stock: Some(true),
+            seller_sku_id: None,
+        };
+        cache.record_pdp_enrichment("S1", &enrichment);
+        let e = cache.get("S1").unwrap();
+        assert_eq!(e.ean, None);
+        assert_eq!(e.source, "tottus_pdp_ssr");
+        assert!(e.pdp_checked);
+    }
+
+    #[test]
+    fn record_pdp_enrichment_keeps_previous_pdp_ean_when_pdp_returns_null() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let cache_path = dir.path().join("tottus_ean_cache.json");
+
+        let mut initial = std::collections::BTreeMap::new();
+        initial.insert(
+            "S1".to_string(),
+            TottusCacheEntry {
+                ean: Some("7751271031103".to_string()),
+                available_qty: None,
+                in_stock: None,
+                seller_sku_id: None,
+                source: "tottus_pdp_ssr".to_string(),
+                pdp_checked: true,
+                updated_at: chrono::Utc::now(),
+            },
+        );
+        std::fs::write(&cache_path, serde_json::to_vec_pretty(&initial).unwrap()).unwrap();
+
+        let mut cache = TottusPdpCache::load(&cache_path).unwrap();
+        let enrichment = TottusPdpEnrichment {
+            ean: None,
+            available_qty: Some(12),
+            in_stock: Some(true),
+            seller_sku_id: None,
+        };
+        cache.record_pdp_enrichment("S1", &enrichment);
+        assert_eq!(
+            cache.get("S1").unwrap().ean.as_deref(),
+            Some("7751271031103")
+        );
+        assert_eq!(cache.get("S1").unwrap().source, "tottus_pdp_ssr");
+        assert!(cache.get("S1").unwrap().pdp_checked);
     }
 }

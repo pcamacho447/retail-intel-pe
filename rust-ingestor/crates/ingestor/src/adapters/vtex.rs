@@ -115,9 +115,9 @@ fn validate_value_gtin(val: Option<&Value>) -> Option<String> {
     value_as_string(val).and_then(|s| validate_gtin_mod10(&s))
 }
 
-fn extract_vtex_ean(item: &Value, product_elem: &Value) -> Option<String> {
+fn extract_vtex_ean(item: &Value, product_elem: &Value) -> Option<(String, &'static str)> {
     if let Some(ean) = normalize_opt_string(item.get("ean").and_then(|v| v.as_str())) {
-        return Some(ean);
+        return Some((ean, "item_ean"));
     }
 
     // VTEX Plaza Vea often leaves items[].ean empty while storing a valid EAN-8 in
@@ -126,14 +126,22 @@ fn extract_vtex_ean(item: &Value, product_elem: &Value) -> Option<String> {
     if let Some(refs) = item.get("referenceId").and_then(|v| v.as_array()) {
         for entry in refs {
             if let Some(gtin) = validate_value_gtin(vtex_field(entry, "Value")) {
-                return Some(gtin);
+                return Some((gtin, "reference_id"));
             }
         }
     }
 
+    let single_item_product = product_elem
+        .get("items")
+        .and_then(|v| v.as_array())
+        .is_some_and(|items| items.len() == 1);
+    if !single_item_product {
+        return None;
+    }
+
     for key in ["productReference", "productReferenceCode"] {
         if let Some(gtin) = validate_value_gtin(product_elem.get(key)) {
-            return Some(gtin);
+            return Some((gtin, "product_reference"));
         }
     }
 
@@ -157,7 +165,7 @@ fn extract_vtex_ean(item: &Value, product_elem: &Value) -> Option<String> {
             .unwrap_or(std::slice::from_ref(val));
         for elem in candidates {
             if let Some(gtin) = validate_value_gtin(Some(elem)) {
-                return Some(gtin);
+                return Some((gtin, "spec"));
             }
         }
     }
@@ -339,7 +347,10 @@ fn parse_vtex_sku(
     retailer: VtexRetailer,
 ) -> Option<SkuItem> {
     let sku_id = value_as_string(item.get("itemId"))?;
-    let ean = extract_vtex_ean(item, product_elem);
+    let (ean, ean_source) = match extract_vtex_ean(item, product_elem) {
+        Some((ean, source)) => (Some(ean), Some(source.to_string())),
+        None => (None, None),
+    };
     let raw_name = normalize_opt_string(item.get("nameComplete").and_then(|v| v.as_str()))
         .or_else(|| normalize_opt_string(item.get("name").and_then(|v| v.as_str())))
         .unwrap_or_else(|| fallback_name.to_string());
@@ -385,7 +396,7 @@ fn parse_vtex_sku(
     Some(SkuItem {
         sku_id,
         ean,
-        ean_source: None,
+        ean_source,
         availability_status: "unknown".to_string(),
         availability_source: "none".to_string(),
         seller_id,
@@ -1465,5 +1476,101 @@ mod tests {
         assert!(
             base == "nogit" || (base.len() == 7 && base.chars().all(|c| c.is_ascii_hexdigit()))
         );
+    }
+
+    #[test]
+    fn vtex_ean_source_reports_origin_and_skips_product_level_for_multi_sku() {
+        let fixture = r#"[
+          {
+            "productId": "p-item-ean",
+            "productName": "Producto Item EAN",
+            "items": [{
+              "itemId": "sku-1",
+              "ean": "7751271031103",
+              "name": "SKU 1",
+              "sellers": []
+            }]
+          },
+          {
+            "productId": "p-ref-id",
+            "productName": "Producto Reference Id",
+            "items": [{
+              "itemId": "sku-2",
+              "ean": "",
+              "name": "SKU 2",
+              "referenceId": [{"Key": "EAN", "Value": "20181512"}],
+              "sellers": []
+            }]
+          },
+          {
+            "productId": "p-prod-ref-single",
+            "productName": "Producto Single Item ProdRef",
+            "productReference": "012345678905",
+            "items": [{
+              "itemId": "sku-3",
+              "ean": "",
+              "name": "SKU 3",
+              "sellers": []
+            }]
+          },
+          {
+            "productId": "p-spec-single",
+            "productName": "Producto Single Item Spec",
+            "Código EAN": ["7751271034142"],
+            "items": [{
+              "itemId": "sku-4",
+              "ean": "",
+              "name": "SKU 4",
+              "sellers": []
+            }]
+          },
+          {
+            "productId": "p-multi-sku-no-item-ean",
+            "productName": "Producto Multi SKU",
+            "productReference": "012345678905",
+            "Código EAN": ["7751271034142"],
+            "items": [
+              {
+                "itemId": "sku-5a",
+                "ean": "",
+                "name": "SKU 5a",
+                "sellers": []
+              },
+              {
+                "itemId": "sku-5b",
+                "ean": "",
+                "name": "SKU 5b",
+                "sellers": []
+              }
+            ]
+          }
+        ]"#;
+
+        let adapter = VtexAdapter::new(VtexRetailer::PlazaVea, test_http());
+        let ctx = FetchContext::for_run(Uuid::new_v4(), "PE", None);
+        let products = adapter.parse_page_payload(fixture, &ctx).unwrap();
+
+        assert_eq!(products[0].skus[0].ean.as_deref(), Some("7751271031103"));
+        assert_eq!(products[0].skus[0].ean_source.as_deref(), Some("item_ean"));
+
+        assert_eq!(products[1].skus[0].ean.as_deref(), Some("20181512"));
+        assert_eq!(
+            products[1].skus[0].ean_source.as_deref(),
+            Some("reference_id")
+        );
+
+        assert_eq!(products[2].skus[0].ean.as_deref(), Some("012345678905"));
+        assert_eq!(
+            products[2].skus[0].ean_source.as_deref(),
+            Some("product_reference")
+        );
+
+        assert_eq!(products[3].skus[0].ean.as_deref(), Some("7751271034142"));
+        assert_eq!(products[3].skus[0].ean_source.as_deref(), Some("spec"));
+
+        assert_eq!(products[4].skus[0].ean, None);
+        assert_eq!(products[4].skus[0].ean_source, None);
+        assert_eq!(products[4].skus[1].ean, None);
+        assert_eq!(products[4].skus[1].ean_source, None);
     }
 }
