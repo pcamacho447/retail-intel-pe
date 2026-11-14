@@ -51,6 +51,7 @@ fn parse_kb_line(line: &str) -> Option<f64> {
 }
 
 /// Parses Linux `/proc/self/status` contents for peak resident memory (`VmHWM`, fallback `VmRSS`) in MB.
+#[must_use]
 pub fn parse_proc_status_ram_mb(contents: &str) -> Option<f64> {
     let mut vm_rss: Option<f64> = None;
     for line in contents.lines() {
@@ -65,6 +66,7 @@ pub fn parse_proc_status_ram_mb(contents: &str) -> Option<f64> {
     vm_rss
 }
 
+#[must_use]
 pub fn read_peak_ram_mb() -> f64 {
     fs::read_to_string("/proc/self/status")
         .ok()
@@ -74,6 +76,8 @@ pub fn read_peak_ram_mb() -> f64 {
 }
 
 impl RunMetrics {
+    #[must_use]
+    #[allow(clippy::cast_precision_loss)]
     pub fn compute_avg_latency_ms(latencies_ms: &[f64]) -> f64 {
         if latencies_ms.is_empty() {
             return 0.0;
@@ -82,6 +86,8 @@ impl RunMetrics {
         sum / latencies_ms.len() as f64
     }
 
+    #[must_use]
+    #[allow(clippy::cast_precision_loss)]
     pub fn bytes_to_mb(bytes: usize) -> f64 {
         bytes as f64 / (1024.0 * 1024.0)
     }

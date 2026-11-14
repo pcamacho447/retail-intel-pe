@@ -17,6 +17,7 @@ use uuid::Uuid;
 
 use crate::domain::BronzeSkuRow;
 
+#[must_use]
 pub fn bronze_arrow_schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
         Field::new("retailer", DataType::Utf8, false),
@@ -66,6 +67,7 @@ pub fn bronze_arrow_schema() -> Arc<Schema> {
     ]))
 }
 
+#[must_use]
 pub fn parquet_output_path(
     output_dir: &Path,
     dt: NaiveDate,
@@ -526,8 +528,7 @@ mod tests {
         let col0_compression = metadata.row_group(0).column(0).compression();
         assert!(
             matches!(col0_compression, Compression::ZSTD(_)),
-            "expected ZSTD compression, got {:?}",
-            col0_compression
+            "expected ZSTD compression, got {col0_compression:?}"
         );
 
         // Read back RecordBatch via Arrow reader and verify values + nulls
