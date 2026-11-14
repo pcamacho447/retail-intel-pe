@@ -1,3 +1,10 @@
+#![allow(
+    clippy::missing_errors_doc,
+    clippy::missing_panics_doc,
+    clippy::too_many_lines,
+    clippy::struct_excessive_bools
+)]
+
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::Path;

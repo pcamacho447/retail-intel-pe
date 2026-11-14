@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 /// Computes the deterministic lowercase hexadecimal SHA-256 digest of a raw JSON payload.
+#[must_use]
 pub fn compute_payload_hash(raw_payload: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(raw_payload.as_bytes());
@@ -56,13 +57,19 @@ impl PayloadDeduplicator {
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
                 Err(err) => {
                     return Err(err).with_context(|| {
-                        format!("failed to read dedup index at {}", self.index_path.display())
+                        format!(
+                            "failed to read dedup index at {}",
+                            self.index_path.display()
+                        )
                     })
                 }
             };
             if let Some(bytes) = bytes {
                 let parsed: SeenHashesFile = serde_json::from_slice(&bytes).with_context(|| {
-                    format!("failed to parse dedup index at {}", self.index_path.display())
+                    format!(
+                        "failed to parse dedup index at {}",
+                        self.index_path.display()
+                    )
                 })?;
                 self.seen.extend(parsed.seen_hashes);
             }
@@ -76,14 +83,17 @@ impl PayloadDeduplicator {
         crate::atomic_write(&self.index_path, &payload)
     }
 
+    #[must_use]
     pub fn len(&self) -> usize {
         self.seen.len()
     }
 
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.seen.is_empty()
     }
 
+    #[must_use]
     pub fn contains(&self, payload_hash: &str) -> bool {
         self.seen.contains(payload_hash)
     }

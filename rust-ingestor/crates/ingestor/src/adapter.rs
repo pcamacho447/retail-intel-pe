@@ -18,6 +18,7 @@ pub struct FetchContext {
 }
 
 impl FetchContext {
+    #[must_use]
     pub fn for_run(
         extraction_run_id: Uuid,
         market_id: impl Into<String>,
@@ -36,6 +37,7 @@ impl FetchContext {
         }
     }
 
+    #[must_use]
     pub fn with_endpoint(mut self, endpoint: impl Into<String>, http_status: u16) -> Self {
         self.source_endpoint = endpoint.into();
         self.http_status = http_status;

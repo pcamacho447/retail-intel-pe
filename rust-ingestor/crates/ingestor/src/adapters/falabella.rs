@@ -1,3 +1,4 @@
+use std::fmt::Write;
 use std::sync::Arc;
 
 use anyhow::{anyhow, Context};
@@ -43,7 +44,7 @@ fn extract_next_data_json(body: &str, http_status: u16) -> anyhow::Result<Value>
 
     let marker = if let Some(pos) = body.find(r#"id="__NEXT_DATA__""#) {
         pos
-    } else if let Some(pos) = body.find(r#"id='__NEXT_DATA__'"#) {
+    } else if let Some(pos) = body.find(r"id='__NEXT_DATA__'") {
         pos
     } else {
         let snippet: String = body.chars().take(200).collect();
@@ -252,13 +253,13 @@ fn has_more_pages(root: &Value, products_len: usize, page_size: usize) -> bool {
     }
 
     if let Some(pagination) = root.pointer("/props/pageProps/pagination") {
-        let current_page = pagination.get("currentPage").and_then(|v| v.as_u64());
-        let total_pages = pagination.get("totalPages").and_then(|v| v.as_u64());
+        let current_page = pagination.get("currentPage").and_then(Value::as_u64);
+        let total_pages = pagination.get("totalPages").and_then(Value::as_u64);
         if let (Some(curr), Some(total)) = (current_page, total_pages) {
             return curr < total;
         }
-        let count = pagination.get("count").and_then(|v| v.as_u64());
-        let per_page = pagination.get("perPage").and_then(|v| v.as_u64());
+        let count = pagination.get("count").and_then(Value::as_u64);
+        let per_page = pagination.get("perPage").and_then(Value::as_u64);
         if let (Some(curr), Some(per), Some(total_count)) = (current_page, per_page, count) {
             return curr.saturating_mul(per) < total_count;
         }
@@ -310,13 +311,13 @@ impl RetailerAdapter for FalabellaListingAdapter {
         if let Some(ref pc) = ctx.postal_code {
             if !url.contains("postalCode=") {
                 let sep = if url.contains('?') { '&' } else { '?' };
-                url.push_str(&format!("{sep}postalCode={}", encode_url_segment(pc)));
+                let _ = write!(url, "{sep}postalCode={}", encode_url_segment(pc));
             }
         }
         if let Some(ref sid) = ctx.store_id {
             if !url.contains("storeId=") {
                 let sep = if url.contains('?') { '&' } else { '?' };
-                url.push_str(&format!("{sep}storeId={}", encode_url_segment(sid)));
+                let _ = write!(url, "{sep}storeId={}", encode_url_segment(sid));
             }
         }
         let resp = self.http.get_text(&url).await?;

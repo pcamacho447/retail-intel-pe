@@ -1,3 +1,4 @@
+use std::fmt::Write;
 use std::sync::Arc;
 
 use anyhow::{anyhow, Context};
@@ -18,6 +19,7 @@ pub enum VtexRetailer {
 }
 
 impl VtexRetailer {
+    #[must_use]
     pub fn slug(&self) -> &'static str {
         match self {
             Self::PlazaVea => "plazavea",
@@ -26,6 +28,7 @@ impl VtexRetailer {
         }
     }
 
+    #[must_use]
     pub fn base_url(&self) -> &'static str {
         match self {
             Self::PlazaVea => "https://www.plazavea.com.pe",
@@ -88,7 +91,7 @@ fn extract_card_price(
                     c.get("MinimumQuantity")
                         .or_else(|| c.get("minimumQuantity"))
                 })
-                .and_then(|v| v.as_u64())
+                .and_then(Value::as_u64)
                 .unwrap_or(0);
             if min_qty > 1 {
                 continue;
@@ -198,7 +201,7 @@ fn parse_vtex_sku(item: &Value, fallback_name: &str) -> Option<SkuItem> {
     let sellers = item.get("sellers").and_then(|v| v.as_array());
     let selected_seller = sellers.and_then(|arr| {
         arr.iter()
-            .find(|s| s.get("sellerDefault").and_then(|v| v.as_bool()) == Some(true))
+            .find(|s| s.get("sellerDefault").and_then(Value::as_bool) == Some(true))
             .or_else(|| arr.first())
     });
 
@@ -209,6 +212,7 @@ fn parse_vtex_sku(item: &Value, fallback_name: &str) -> Option<SkuItem> {
             let list_price = positive_f64(offer.get("ListPrice"));
             let selling_price = positive_f64(offer.get("Price"));
             let card_price = extract_card_price(offer, &sku_id, list_price, selling_price);
+            #[allow(clippy::cast_possible_truncation)]
             let available_qty = offer
                 .get("AvailableQuantity")
                 .and_then(|v| v.as_i64().or_else(|| v.as_f64().map(|f| f as i64)));
@@ -361,13 +365,13 @@ impl RetailerAdapter for VtexAdapter {
         if let Some(ref pc) = ctx.postal_code {
             if !url.contains("_postalCode=") {
                 let sep = if url.contains('?') { '&' } else { '?' };
-                url.push_str(&format!("{sep}_postalCode={}", encode_url_segment(pc)));
+                let _ = write!(url, "{sep}_postalCode={}", encode_url_segment(pc));
             }
         }
         if let Some(ref sid) = ctx.store_id {
             if !url.contains("_storeId=") {
                 let sep = if url.contains('?') { '&' } else { '?' };
-                url.push_str(&format!("{sep}_storeId={}", encode_url_segment(sid)));
+                let _ = write!(url, "{sep}_storeId={}", encode_url_segment(sid));
             }
         }
         let resp = self.http.get_text(&url).await?;
@@ -561,7 +565,7 @@ mod tests {
         let adapter = VtexAdapter::new(VtexRetailer::Metro, test_http());
         let ctx = FetchContext::for_run(Uuid::new_v4(), "PE", None);
         let products = adapter.parse_page_payload("[]", &ctx).unwrap();
-        assert!(products.is_empty());
+        assert_eq!(products, [] as [Product; 0]);
     }
 
     #[test]

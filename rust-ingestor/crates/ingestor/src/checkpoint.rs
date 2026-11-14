@@ -20,6 +20,7 @@ pub struct CheckpointState {
 }
 
 impl CheckpointState {
+    #[must_use]
     pub fn is_valid_for_run(&self, category: &str, run_date: NaiveDate, page_size: usize) -> bool {
         self.category == category
             && self.updated_at.date_naive() == run_date
@@ -32,6 +33,7 @@ pub struct CheckpointStore {
 }
 
 /// Sanitizes a category/query slug so it is safe to use inside a checkpoint filename.
+#[must_use]
 pub fn sanitize_category(category: &str) -> String {
     let mut out = String::with_capacity(category.len());
     let mut prev_underscore = true;
@@ -58,12 +60,14 @@ pub fn sanitize_category(category: &str) -> String {
 }
 
 impl CheckpointStore {
+    #[must_use]
     pub fn new(bronze_dir: impl AsRef<Path>) -> Self {
         Self {
             checkpoints_dir: bronze_dir.as_ref().join("checkpoints"),
         }
     }
 
+    #[must_use]
     pub fn path_for(&self, retailer: &str, category: &str) -> PathBuf {
         let filename = format!(
             "{}_{}.json",
