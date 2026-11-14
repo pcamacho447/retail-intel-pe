@@ -13,10 +13,10 @@ Todo dato citado aquí salió del código en `4e96029` (`b0316bc` solo añade do
 | Aspecto | Estado verificado |
 | --- | --- |
 | Código | Ingestor Rust (`rust-ingestor/crates/ingestor`, v0.1.0) con adaptadores VTEX (Plaza Vea, Metro, Wong) y Falabella/Tottus; `scripts/inspect_bronze.py`; DDL PostgreSQL borrador |
-| Pruebas | 63/63 Rust, 13/13 pytest, `fmt` y `clippy -D warnings` limpios (reproducido en copia aislada) |
+| Pruebas | 103 + 6 Rust, 23 pytest tras reconciliar con `main` |
 | Datos | Piloto de 26 requests: Metro 120, Wong 120, Plaza Vea 73, Tottus 48 filas |
-| Repositorio | Remoto `origin` en GitHub, **público** desde el 14-nov-2026 (`main` y tags publicados). `Cargo.lock` ignorado en `.gitignore`. Entorno Python sin declarar (venv creado con `uv`, sin `pyproject` ni lock) |
-| Trabajo paralelo | Rama `worktree/rapid-stone-5ff6`: otra sesión ejecuta un plan de hardening de 4 tareas **partiendo de `ca80799`, anterior a E1.5** (ver sección 7.0) |
+| Repositorio | Remoto `origin` en GitHub, **público** desde el 14-nov-2026 (`main` y tags publicados). `Cargo.lock` versionado (ya no ignorado). Entorno Python sin declarar (venv creado con `uv`, sin `pyproject` ni lock) |
+| Trabajo paralelo | `rapid-stone` fusionado en `main` (`541f567`) y reconciliado en E1.6 (`docs/superpowers/plans/2026-11-14-e1.6-reconcile-main.md`) |
 | Fases Silver/Gold/ER | No existen todavía (correcto: no se debe construir encima de un Bronze con defectos de contrato) |
 
 Puntajes de la auditoría (0–10): Arquitectura 6.5 · Ingesta 6 · Data Engineering 5 · Calidad de datos 3.5 · Entity Resolution 2.5 · Retail Analytics 2 · Testing 6 · Escalabilidad 3 · Mantenibilidad 6 · Producción 2.
@@ -193,16 +193,9 @@ Disponibles en Antigravity (`agy agents`, `agy plugin list`, verificado 14-nov-2
 
 ## 7. Fases y criterios de salida
 
-### 7.0 Trabajo paralelo a reconciliar (antes de cualquier merge)
+### 7.0 Trabajo paralelo reconciliado
 
-La rama `worktree/rapid-stone-5ff6` (commits `ae7fc31`, `d9abd22`, `793f2b3`, y una tarea más en curso al escribir esto) implementa `docs/superpowers/plans/2026-11-14-e1-rust-ingestor-hardening.md` sobre **`ca80799`**: esquema de 28 columnas y 42 pruebas, es decir, el código previo a E1.5. Toca `checkpoint.rs`, `dedup.rs`, `runner.rs`, `adapters/falabella.rs`, `adapters/vtex.rs` y `http.rs`, los mismos archivos que E1.5 reescribió en `main` (solo `falabella.rs` cambió en +1 323 líneas). Consecuencias:
-
-- **No se puede fusionar tal cual**: chocará con `main` en casi todos los archivos, y parte de lo que hace ya existe en E1.5 (`page_size` en checkpoints, desambiguación de rutas por hash).
-- **Se solapa con E1.6** en: `Cargo.lock` versionado (T1), omitir productos malformados sin abortar la página (T6), conteo de productos sin SKU (T8). E1.6 los implementa sobre la base correcta.
-- **Contradice una decisión de E1.6**: sus checkpoints expiran por día **UTC**; E1.6 fija la fecha de negocio en **Lima** (T7).
-- **Aporta cosas que E1.6 no cubre** y vale la pena rescatar después, re-aplicándolas sobre la rama de E1.6 (no por merge): parser de precios peruanos (`S/ 1,299.90`, `S/ 1.299,90`, rangos), `Retry-After` + jitter en `http.rs`, `persist()` de dedup que une con lo que haya en disco, expiración diaria de checkpoints (con fecha de Lima).
-
-Orden recomendado: cerrar E1.6 → portar esos cuatro aportes como tareas pequeñas con sus pruebas → descartar la rama. La decisión es del propietario.
+**Reconciliado (14-nov-2026):** `worktree/rapid-stone-5ff6` se fusionó en `main` (`541f567`, seguido de `.gitignore` de `data/` en `c9b269b`) y quedó integrado en `feat/e1.6-bronze-contract` mediante merge (`--no-ff`) siguiendo `docs/superpowers/plans/2026-11-14-e1.6-reconcile-main.md`. **Conservado de `main`:** deduplicación con unión en disco al persistir (`PayloadDeduplicator::persist`), respeto de `Retry-After` (tope 30 s) con jitter en `http.rs`, expiración diaria de checkpoints, guardas de productos sin SKU (sin marcar hash en `runner.rs`) y sin `productId` en VTEX/Tottus, parser de precios peruanos en Tottus (`S/`, comas y rangos), `Cargo.lock` versionado y compatibilidad MSRV 1.82. **Corregido en la reconciliación (hallazgos 1–5):** ubicación de `CategoryOutcome` solo dentro de `if cp.completed` en `runner.rs` (sin saltar checkpoints vencidos en `else`), validación y log de expiración de checkpoints por fecha de negocio `America/Lima` (UTC-5), reconocimiento de coma como separador de miles en precios peruanos sin decimales (`1,299`, `12,999`, `1,299,000`), eliminación de parámetros geográficos sin verificar (`_postalCode`/`_storeId` en VTEX y `postalCode`/`storeId` en Tottus) en `fetch_page`, y conteo de ítems rechazados de Tottus en `products_rejected` y `has_more_pages`.
 
 ### E1.6 — Integridad del contrato Bronze (vigente)
 
@@ -259,14 +252,14 @@ Sale cuando: precisión ≥ 0.98 en matches automáticos sobre el benchmark, con
 | 14 | `inspect_bronze` como gate | P2 | S | E1.6 T9 |
 | 15 | Política de rastreo escrita | P2 | S | E1.6 T10 |
 | 16 | Dinero en decimal, features mínimas de tokio/parquet, partir adaptadores, errores tipados | P3 | M | después de E2 |
-| 17 | Portar desde `worktree/rapid-stone-5ff6`: parser de precios peruanos, `Retry-After` + jitter, dedup con unión en disco, expiración diaria de checkpoints (fecha de Lima) | P2 | S–M | tras E1.6 (sección 7.0) |
+| 17 | Portar desde `worktree/rapid-stone-5ff6`: parser de precios peruanos, `Retry-After` + jitter, dedup con unión en disco, expiración diaria de checkpoints (fecha de Lima) | P2 | S–M | hecho en la reconciliación; queda `clippy::pedantic` en `make verify` (≈25 avisos, P3) |
 
 ## 9. Decisiones del propietario
 
 | Decisión | Por qué no la toma un agente | Recomendación |
 | --- | --- | --- |
 | Push de ramas y visibilidad del repo | El repo es público: cada push publica código, `state/` y documentos (incluida la política de rastreo y el User-Agent usado) | Revisar cada rama antes de subirla; valorar si el repo debe seguir siendo público mientras no haya política de rastreo decidida |
-| Destino de la rama `worktree/rapid-stone-5ff6` | Es trabajo en curso lanzado por el propietario | Portar sus cuatro aportes tras E1.6 y descartar la rama (sección 7.0) |
+| Destino de la rama `worktree/rapid-stone-5ff6` | Es trabajo en curso lanzado por el propietario | Fusionada en `main`; queda decidir si se borra la rama remota `origin/worktree/rapid-stone-5ff6` |
 | User-Agent y política de rastreo | Hoy se envía un UA de Chrome sin política escrita; es postura legal y comercial | Revisar términos y `robots.txt` de cada retailer, y decidir si el UA se identifica |
 | Regionalización (precio por tienda / código postal) | Cambia alcance, volumen y costo | Investigar cómo fija contexto cada sitio antes de prometer precios por zona |
 | Dependencias nuevas (`hypothesis`, extensión `postgres` de DuckDB, Splink, `pytz`) | Amplían superficie y requieren red | Decidir caso a caso en E2/E3 con la justificación de la regla 5 |
