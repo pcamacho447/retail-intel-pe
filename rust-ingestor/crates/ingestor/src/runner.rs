@@ -8,10 +8,10 @@ use uuid::Uuid;
 use crate::adapter::{FetchContext, RetailerAdapter};
 use crate::checkpoint::{CheckpointState, CheckpointStore};
 use crate::dedup::PayloadDeduplicator;
-use crate::domain::BronzeSkuRow;
+use crate::domain::{BronzeSkuRow, BRONZE_CONTRACT_VERSION};
 use crate::http::RateLimitedHttpClient;
-use crate::metrics::{read_peak_ram_mb, RunMetrics};
-use crate::storage::parquet_writer::write_bronze_parquet;
+use crate::metrics::{read_peak_ram_mb, CategoryOutcome, RunMetrics};
+use crate::storage::parquet_writer::BronzeWriter;
 
 const LIMA_UTC_OFFSET_SECS: i32 = 5 * 3600;
 
@@ -70,8 +70,9 @@ pub async fn run_ingest(
         applied_postal_code,
     );
 
-    let mut all_rows: Vec<BronzeSkuRow> = Vec::new();
+    let mut writer = BronzeWriter::create(&config.output_dir, run_date, slug, extraction_run_id)?;
     let mut pending_checkpoints: Vec<CheckpointState> = Vec::new();
+    let mut categories_detail: Vec<CategoryOutcome> = Vec::with_capacity(config.categories.len());
     let mut products_recovered: usize = 0;
     let mut skus_recovered: usize = 0;
     let mut pages_fetched: usize = 0;
@@ -93,6 +94,16 @@ pub async fn run_ingest(
                         category = %category,
                         "Skipping already completed category from checkpoint"
                     );
+                    categories_detail.push(CategoryOutcome {
+                        category: category.clone(),
+                        pages_fetched: 0,
+                        products: 0,
+                        skus: 0,
+                        products_rejected: 0,
+                        products_without_skus: 0,
+                        next_offset: cp.next_offset,
+                        stop_reason: "exhausted".to_string(),
+                    });
                     continue;
                 }
                 offset = cp.next_offset;
@@ -113,7 +124,14 @@ pub async fn run_ingest(
 
         let category_ctx = base_ctx.clone().with_query_term(category);
         let mut pages_this_run = 0usize;
+        let mut cat_products = 0usize;
+        let mut cat_skus = 0usize;
+        let mut cat_products_rejected = 0usize;
+        let mut cat_products_without_skus = 0usize;
+        let mut cat_next_offset = offset;
+        let mut cat_stop_reason: Option<&'static str> = None;
         let mut latest_cp: Option<CheckpointState> = None;
+
         while pages_this_run < config.max_pages {
             match adapter
                 .fetch_page(category, offset, effective_page_size, &category_ctx)
@@ -125,16 +143,29 @@ pub async fn run_ingest(
                     pages_this_run += 1;
                     total_bytes += batch.raw_bytes;
                     latencies_ms.push(batch.latency_ms);
+                    cat_products_rejected += batch.products_rejected;
+                    cat_next_offset = batch.next_offset;
 
+                    let mut page_rows: Vec<BronzeSkuRow> = Vec::new();
                     for product in &batch.products {
                         products_recovered += 1;
+                        cat_products += 1;
+                        if product.skus.is_empty() {
+                            cat_products_without_skus += 1;
+                        }
                         let is_dup = dedup.check_and_mark(&product.payload_hash);
                         if is_dup {
                             duplicates_detected += 1;
                         }
                         let bronze_rows = product.to_bronze_rows(is_dup);
                         skus_recovered += bronze_rows.len();
-                        all_rows.extend(bronze_rows);
+                        cat_skus += bronze_rows.len();
+                        page_rows.extend(bronze_rows);
+                    }
+
+                    if let Err(err) = writer.write_rows(&page_rows) {
+                        writer.abort();
+                        return Err(err);
                     }
 
                     let completed = !batch.has_more;
@@ -150,6 +181,7 @@ pub async fn run_ingest(
                     });
 
                     if completed {
+                        cat_stop_reason = Some("exhausted");
                         break;
                     }
                     offset = batch.next_offset;
@@ -163,6 +195,7 @@ pub async fn run_ingest(
                         "Failed fetching page"
                     );
                     last_error = Some(err);
+                    cat_stop_reason = Some("error");
                     break;
                 }
             }
@@ -171,22 +204,29 @@ pub async fn run_ingest(
         if let Some(cp) = latest_cp {
             pending_checkpoints.push(cp);
         }
+
+        let stop_reason = cat_stop_reason.unwrap_or("max_pages");
+        categories_detail.push(CategoryOutcome {
+            category: category.clone(),
+            pages_fetched: pages_this_run,
+            products: cat_products,
+            skus: cat_skus,
+            products_rejected: cat_products_rejected,
+            products_without_skus: cat_products_without_skus,
+            next_offset: cat_next_offset,
+            stop_reason: stop_reason.to_string(),
+        });
     }
 
     if pages_fetched == 0 {
         if let Some(err) = last_error {
+            writer.abort();
             return Err(err);
         }
     }
 
-    // Write Parquet first so dedup hashes and checkpoints are only committed once Bronze data is durable.
-    let parquet_path = write_bronze_parquet(
-        &config.output_dir,
-        run_date,
-        slug,
-        extraction_run_id,
-        &all_rows,
-    )?;
+    // Finalize Parquet first so dedup hashes and checkpoints are only committed once Bronze data is durable.
+    let parquet_path = writer.finish()?;
     dedup.persist()?;
     for cp in &pending_checkpoints {
         checkpoints.save(cp)?;
@@ -194,17 +234,25 @@ pub async fn run_ingest(
 
     let http_stats = http.stats();
     let error_msg = last_error.as_ref().map(|err| format!("{err:#}"));
-    let status = if error_msg.is_some() {
-        "partial_error"
-    } else {
-        "success"
-    };
+    let status =
+        if categories_detail.iter().any(|c| c.stop_reason == "error") || error_msg.is_some() {
+            "partial_error"
+        } else if categories_detail
+            .iter()
+            .any(|c| c.stop_reason == "max_pages")
+        {
+            "truncated"
+        } else {
+            "success"
+        };
 
     let metrics = RunMetrics {
         extraction_run_id,
         retailer: slug.to_string(),
         extractor_version: adapter.extractor_version().to_string(),
+        bronze_contract_version: BRONZE_CONTRACT_VERSION.to_string(),
         categories: config.categories.clone(),
+        categories_detail,
         started_at: started_utc,
         finished_at: Utc::now(),
         business_date,
@@ -849,5 +897,178 @@ mod tests {
             logs.is_empty(),
             "expected no unapplied postal_code warning when adapter applies geo context, got: {logs}"
         );
+    }
+
+    #[tokio::test]
+    async fn run_ingest_marks_truncated_when_max_pages_stops_with_more_pages() {
+        let dir = TempDir::new().unwrap();
+        let page1 = r#"[
+            {"productId":"101","productName":"Prod 1","items":[{"itemId":"1011","ean":"7750000000011","name":"Prod 1","sellers":[{"sellerId":"1","commertialOffer":{"ListPrice":5.0,"Price":4.5,"AvailableQuantity":10}}]}]},
+            {"productId":"102","productName":"Prod 2","items":[{"itemId":"1021","ean":"7750000000028","name":"Prod 2","sellers":[{"sellerId":"1","commertialOffer":{"ListPrice":6.0,"Price":5.5,"AvailableQuantity":8}}]}]}
+        ]"#;
+        let page2 = r#"[
+            {"productId":"103","productName":"Prod 3","items":[{"itemId":"1031","ean":"7750000000035","name":"Prod 3","sellers":[{"sellerId":"1","commertialOffer":{"ListPrice":7.0,"Price":6.5,"AvailableQuantity":4}}]}]},
+            {"productId":"104","productName":"Prod 4","items":[{"itemId":"1041","ean":"7750000000042","name":"Prod 4","sellers":[{"sellerId":"1","commertialOffer":{"ListPrice":8.0,"Price":7.5,"AvailableQuantity":2}}]}]}
+        ]"#;
+        let (base_url, calls) =
+            spawn_vtex_sequence(vec![(206, page1.to_string()), (206, page2.to_string())]).await;
+
+        let http = fast_http();
+        let adapter = VtexAdapter::with_base_url(VtexRetailer::PlazaVea, &base_url, http.clone());
+        let cfg = IngestConfig {
+            retailer: "plazavea".to_string(),
+            categories: vec!["lacteos".to_string()],
+            page_size: 2,
+            max_pages: 1,
+            output_dir: dir.path().to_path_buf(),
+            resume: false,
+            market_id: "PE".to_string(),
+            postal_code: None,
+        };
+
+        let metrics = run_ingest(&adapter, &http, &cfg).await.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(metrics.status, "truncated");
+        assert_eq!(metrics.bronze_contract_version, "2.0.0");
+        assert_eq!(metrics.categories_detail.len(), 1);
+        assert_eq!(metrics.categories_detail[0].category, "lacteos");
+        assert_eq!(metrics.categories_detail[0].stop_reason, "max_pages");
+        assert_eq!(metrics.categories_detail[0].pages_fetched, 1);
+        assert_eq!(metrics.categories_detail[0].products, 2);
+        assert_eq!(metrics.categories_detail[0].skus, 2);
+        assert_eq!(metrics.categories_detail[0].next_offset, 2);
+
+        let cp = CheckpointStore::new(dir.path())
+            .load("plazavea", "lacteos")
+            .unwrap()
+            .unwrap();
+        assert!(!cp.completed);
+        assert_eq!(cp.next_offset, 2);
+    }
+
+    #[tokio::test]
+    async fn run_ingest_reports_exhausted_as_success_and_counts_products_without_skus() {
+        let dir = TempDir::new().unwrap();
+        let page1 = r#"[
+            {"productId":"201","productName":"With SKU","items":[{"itemId":"2011","ean":"7750000000219","name":"With SKU","sellers":[{"sellerId":"1","commertialOffer":{"ListPrice":5.0,"Price":4.5,"AvailableQuantity":10}}]}]},
+            {"productId":"202","productName":"Without SKU","items":[]}
+        ]"#;
+        let (base_url, calls) =
+            spawn_vtex_sequence(vec![(206, page1.to_string()), (200, "[]".to_string())]).await;
+
+        let http = fast_http();
+        let adapter = VtexAdapter::with_base_url(VtexRetailer::PlazaVea, &base_url, http.clone());
+        let cfg = IngestConfig {
+            retailer: "plazavea".to_string(),
+            categories: vec!["lacteos".to_string()],
+            page_size: 2,
+            max_pages: 5,
+            output_dir: dir.path().to_path_buf(),
+            resume: false,
+            market_id: "PE".to_string(),
+            postal_code: None,
+        };
+
+        let metrics = run_ingest(&adapter, &http, &cfg).await.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(metrics.status, "success");
+        assert_eq!(metrics.bronze_contract_version, "2.0.0");
+        assert_eq!(metrics.categories_detail.len(), 1);
+        assert_eq!(metrics.categories_detail[0].stop_reason, "exhausted");
+        assert_eq!(metrics.categories_detail[0].pages_fetched, 2);
+        assert_eq!(metrics.categories_detail[0].products, 2);
+        assert_eq!(metrics.categories_detail[0].skus, 1);
+        assert_eq!(metrics.categories_detail[0].products_without_skus, 1);
+        assert_eq!(metrics.products_recovered, 2);
+        assert_eq!(metrics.skus_recovered, 1);
+
+        let cp = CheckpointStore::new(dir.path())
+            .load("plazavea", "lacteos")
+            .unwrap()
+            .unwrap();
+        assert!(cp.completed);
+    }
+
+    #[tokio::test]
+    async fn run_ingest_zero_page_error_leaves_no_parquet_and_partial_error_overrides_truncated() {
+        // Case 1: first page fails -> pages_fetched == 0 -> writer aborted cleanly, no parquet/tmp/metrics
+        let dir1 = TempDir::new().unwrap();
+        let (base_url1, _) = spawn_vtex_sequence(vec![(404, "not found".to_string())]).await;
+        let http1 = fast_http();
+        let adapter1 =
+            VtexAdapter::with_base_url(VtexRetailer::PlazaVea, &base_url1, http1.clone());
+        let cfg1 = IngestConfig {
+            retailer: "plazavea".to_string(),
+            categories: vec!["lacteos".to_string()],
+            page_size: 2,
+            max_pages: 1,
+            output_dir: dir1.path().to_path_buf(),
+            resume: false,
+            market_id: "PE".to_string(),
+            postal_code: None,
+        };
+        assert!(run_ingest(&adapter1, &http1, &cfg1).await.is_err());
+
+        let run_date = business_date_lima(Utc::now());
+        let part_dir1 = dir1
+            .path()
+            .join(format!("dt={}", run_date.format("%Y-%m-%d")))
+            .join("retailer=plazavea");
+        if part_dir1.exists() {
+            assert!(
+                std::fs::read_dir(&part_dir1).unwrap().next().is_none(),
+                "zero-page failure must not leave any parquet or temp files"
+            );
+        }
+
+        // Case 2: cat1 stops at max_pages, cat2 fails -> metrics status is "partial_error"
+        let dir2 = TempDir::new().unwrap();
+        let full_page = r#"[
+            {"productId":"301","productName":"P1","items":[{"itemId":"3011","ean":"7750000000318","name":"P1","sellers":[]}]},
+            {"productId":"302","productName":"P2","items":[{"itemId":"3021","ean":"7750000000325","name":"P2","sellers":[]}]}
+        ]"#;
+        let (base_url2, _) = spawn_vtex_sequence(vec![
+            (206, full_page.to_string()),
+            (404, "missing".to_string()),
+        ])
+        .await;
+        let http2 = fast_http();
+        let adapter2 =
+            VtexAdapter::with_base_url(VtexRetailer::PlazaVea, &base_url2, http2.clone());
+        let cfg2 = IngestConfig {
+            retailer: "plazavea".to_string(),
+            categories: vec!["lacteos".to_string(), "broken_cat".to_string()],
+            page_size: 2,
+            max_pages: 1,
+            output_dir: dir2.path().to_path_buf(),
+            resume: false,
+            market_id: "PE".to_string(),
+            postal_code: None,
+        };
+        assert!(run_ingest(&adapter2, &http2, &cfg2).await.is_err());
+
+        let part_dir2 = dir2
+            .path()
+            .join(format!(
+                "dt={}",
+                business_date_lima(Utc::now()).format("%Y-%m-%d")
+            ))
+            .join("retailer=plazavea");
+        let metrics_file = std::fs::read_dir(&part_dir2)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .find(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("metrics-") && n.ends_with(".json"))
+            })
+            .expect("metrics json must be persisted on partial_error");
+        let metrics: RunMetrics =
+            serde_json::from_str(&std::fs::read_to_string(&metrics_file).unwrap()).unwrap();
+        assert_eq!(metrics.status, "partial_error");
+        assert_eq!(metrics.categories_detail.len(), 2);
+        assert_eq!(metrics.categories_detail[0].stop_reason, "max_pages");
+        assert_eq!(metrics.categories_detail[1].stop_reason, "error");
+        assert_eq!(metrics.categories_detail[1].pages_fetched, 0);
     }
 }

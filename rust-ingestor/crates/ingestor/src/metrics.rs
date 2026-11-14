@@ -5,12 +5,26 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CategoryOutcome {
+    pub category: String,
+    pub pages_fetched: usize,
+    pub products: usize,
+    pub skus: usize,
+    pub products_rejected: usize,
+    pub products_without_skus: usize,
+    pub next_offset: usize,
+    pub stop_reason: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RunMetrics {
     pub extraction_run_id: Uuid,
     pub retailer: String,
     pub extractor_version: String,
+    pub bronze_contract_version: String,
     pub categories: Vec<String>,
+    pub categories_detail: Vec<CategoryOutcome>,
     pub started_at: DateTime<Utc>,
     pub finished_at: DateTime<Utc>,
     pub business_date: String,
@@ -112,7 +126,30 @@ mod tests {
             extraction_run_id: run_id,
             retailer: "plazavea".to_string(),
             extractor_version: "vtex-catalog-v1.0.0".to_string(),
+            bronze_contract_version: crate::domain::BRONZE_CONTRACT_VERSION.to_string(),
             categories: vec!["lacteos".to_string(), "abarrotes".to_string()],
+            categories_detail: vec![
+                CategoryOutcome {
+                    category: "lacteos".to_string(),
+                    pages_fetched: 1,
+                    products: 20,
+                    skus: 23,
+                    products_rejected: 0,
+                    products_without_skus: 0,
+                    next_offset: 20,
+                    stop_reason: "exhausted".to_string(),
+                },
+                CategoryOutcome {
+                    category: "abarrotes".to_string(),
+                    pages_fetched: 1,
+                    products: 20,
+                    skus: 22,
+                    products_rejected: 1,
+                    products_without_skus: 2,
+                    next_offset: 20,
+                    stop_reason: "max_pages".to_string(),
+                },
+            ],
             started_at: now,
             finished_at: now,
             business_date: "2026-11-13".to_string(),

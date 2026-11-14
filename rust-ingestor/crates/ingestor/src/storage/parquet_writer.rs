@@ -180,6 +180,124 @@ fn build_record_batch(schema: Arc<Schema>, rows: &[BronzeSkuRow]) -> anyhow::Res
     .context("failed to build Arrow RecordBatch for BronzeSkuRow")
 }
 
+pub const BRONZE_ROW_GROUP_ROWS: usize = 2_000;
+
+/// Streaming Parquet writer that buffers at most one row group (`BRONZE_ROW_GROUP_ROWS`)
+/// into a temporary file and atomically renames it into the Hive partition on `finish`.
+pub struct BronzeWriter {
+    writer: Option<ArrowWriter<File>>,
+    schema: Arc<Schema>,
+    tmp_path: PathBuf,
+    final_path: PathBuf,
+    rows_written: usize,
+    finished: bool,
+}
+
+impl BronzeWriter {
+    pub fn create(
+        output_dir: &Path,
+        dt: NaiveDate,
+        retailer: &str,
+        run_id: Uuid,
+    ) -> anyhow::Result<Self> {
+        let final_path = parquet_output_path(output_dir, dt, retailer, run_id);
+        let parent = final_path
+            .parent()
+            .context("Parquet output path must have a parent directory")?;
+        fs::create_dir_all(parent).with_context(|| {
+            format!("failed to create Bronze partition dir {}", parent.display())
+        })?;
+
+        let schema = bronze_arrow_schema();
+        let props = WriterProperties::builder()
+            .set_compression(Compression::ZSTD(ZstdLevel::try_new(3)?))
+            .set_max_row_group_size(BRONZE_ROW_GROUP_ROWS)
+            .build();
+
+        let tmp_path = parent.join(format!(".part-{run_id}.parquet.tmp.{}", Uuid::new_v4()));
+        let file = File::create(&tmp_path).with_context(|| {
+            format!("failed to create Parquet temp file {}", tmp_path.display())
+        })?;
+        let writer = match ArrowWriter::try_new(file, schema.clone(), Some(props)) {
+            Ok(writer) => writer,
+            Err(err) => {
+                let _ = fs::remove_file(&tmp_path);
+                return Err(err.into());
+            }
+        };
+
+        Ok(Self {
+            writer: Some(writer),
+            schema,
+            tmp_path,
+            final_path,
+            rows_written: 0,
+            finished: false,
+        })
+    }
+
+    pub fn write_rows(&mut self, rows: &[BronzeSkuRow]) -> anyhow::Result<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let writer = self
+            .writer
+            .as_mut()
+            .context("cannot write rows to a closed BronzeWriter")?;
+        let batch = build_record_batch(self.schema.clone(), rows)?;
+        writer.write(&batch)?;
+        self.rows_written += rows.len();
+        Ok(())
+    }
+
+    pub fn rows_written(&self) -> usize {
+        self.rows_written
+    }
+
+    pub fn finish(mut self) -> anyhow::Result<PathBuf> {
+        self.finished = true;
+        let res = (|| -> anyhow::Result<()> {
+            let writer = self
+                .writer
+                .take()
+                .context("BronzeWriter already finalized")?;
+            let file = writer.into_inner()?;
+            file.sync_all()?;
+            drop(file);
+            fs::rename(&self.tmp_path, &self.final_path).with_context(|| {
+                format!(
+                    "failed to finalize Parquet file {}",
+                    self.final_path.display()
+                )
+            })?;
+            Ok(())
+        })();
+
+        if let Err(err) = res {
+            self.writer = None;
+            let _ = fs::remove_file(&self.tmp_path);
+            return Err(err);
+        }
+
+        Ok(self.final_path.clone())
+    }
+
+    pub fn abort(mut self) {
+        self.finished = true;
+        self.writer = None;
+        let _ = fs::remove_file(&self.tmp_path);
+    }
+}
+
+impl Drop for BronzeWriter {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.writer = None;
+            let _ = fs::remove_file(&self.tmp_path);
+        }
+    }
+}
+
 pub fn write_bronze_parquet(
     output_dir: &Path,
     dt: NaiveDate,
@@ -187,43 +305,12 @@ pub fn write_bronze_parquet(
     run_id: Uuid,
     rows: &[BronzeSkuRow],
 ) -> anyhow::Result<PathBuf> {
-    let out_path = parquet_output_path(output_dir, dt, retailer, run_id);
-    let parent = out_path
-        .parent()
-        .context("Parquet output path must have a parent directory")?;
-    fs::create_dir_all(parent)
-        .with_context(|| format!("failed to create Bronze partition dir {}", parent.display()))?;
-
-    let schema = bronze_arrow_schema();
-    let batch = build_record_batch(schema.clone(), rows)?;
-    let props = WriterProperties::builder()
-        .set_compression(Compression::ZSTD(ZstdLevel::try_new(3)?))
-        .build();
-
-    let tmp_path = parent.join(format!(".part-{run_id}.parquet.tmp"));
-    let write_res = (|| -> anyhow::Result<()> {
-        let file = File::create(&tmp_path)
-            .with_context(|| format!("failed to create Parquet file {}", tmp_path.display()))?;
-        let mut writer = ArrowWriter::try_new(file, schema, Some(props))?;
-        if batch.num_rows() > 0 {
-            writer.write(&batch)?;
-        }
-        let inner = writer.into_inner()?;
-        inner.sync_all()?;
-        Ok(())
-    })();
-
-    if let Err(err) = write_res {
-        let _ = fs::remove_file(&tmp_path);
+    let mut writer = BronzeWriter::create(output_dir, dt, retailer, run_id)?;
+    if let Err(err) = writer.write_rows(rows) {
+        writer.abort();
         return Err(err);
     }
-
-    fs::rename(&tmp_path, &out_path).with_context(|| {
-        let _ = fs::remove_file(&tmp_path);
-        format!("failed to finalize Parquet file {}", out_path.display())
-    })?;
-
-    Ok(out_path)
+    writer.finish()
 }
 
 #[cfg(test)]
@@ -649,5 +736,116 @@ mod tests {
         assert_eq!(reader.schema().fields().len(), 40);
         let total_rows: usize = reader.map(|b| b.unwrap().num_rows()).sum();
         assert_eq!(total_rows, 0);
+    }
+
+    #[test]
+    fn bronze_writer_streams_pages_into_row_groups() {
+        let dir = TempDir::new().unwrap();
+        let dt = NaiveDate::from_ymd_opt(2026, 11, 13).unwrap();
+        let run_id = Uuid::new_v4();
+        let template = sample_rows(run_id).into_iter().next().unwrap();
+
+        let mut writer = BronzeWriter::create(dir.path(), dt, "plazavea", run_id).unwrap();
+        for page in 0..3 {
+            let chunk: Vec<BronzeSkuRow> = (0..1_500)
+                .map(|idx| {
+                    let mut row = template.clone();
+                    row.sku_id = format!("sku-{page}-{idx}");
+                    row
+                })
+                .collect();
+            writer.write_rows(&chunk).unwrap();
+        }
+        assert_eq!(writer.rows_written(), 4_500);
+
+        let path = writer.finish().unwrap();
+        let builder = ParquetRecordBatchReaderBuilder::try_new(File::open(&path).unwrap()).unwrap();
+        let md = builder.metadata().clone();
+        assert_eq!(md.file_metadata().num_rows(), 4_500);
+        assert_eq!(md.num_row_groups(), 3);
+        assert_eq!(md.row_group(0).num_rows(), BRONZE_ROW_GROUP_ROWS as i64);
+        assert_eq!(md.row_group(1).num_rows(), BRONZE_ROW_GROUP_ROWS as i64);
+        assert_eq!(md.row_group(2).num_rows(), 500);
+
+        let entries: Vec<_> = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(entries.len(), 1);
+    }
+
+    #[test]
+    fn bronze_writer_abort_leaves_no_file() {
+        let dir = TempDir::new().unwrap();
+        let dt = NaiveDate::from_ymd_opt(2026, 11, 13).unwrap();
+        let run_id = Uuid::new_v4();
+        let template = sample_rows(run_id).into_iter().next().unwrap();
+        let chunk: Vec<BronzeSkuRow> = (0..10)
+            .map(|idx| {
+                let mut row = template.clone();
+                row.sku_id = format!("sku-{idx}");
+                row
+            })
+            .collect();
+
+        let mut writer = BronzeWriter::create(dir.path(), dt, "plazavea", run_id).unwrap();
+        writer.write_rows(&chunk).unwrap();
+        assert_eq!(writer.rows_written(), 10);
+        writer.abort();
+
+        let partition_dir = dir.path().join("dt=2026-11-13").join("retailer=plazavea");
+        let entries: Vec<_> = std::fs::read_dir(&partition_dir).unwrap().collect();
+        assert!(
+            entries.is_empty(),
+            "partition directory must contain no files after abort"
+        );
+    }
+
+    #[test]
+    fn bronze_writer_drop_removes_temp_file() {
+        let dir = TempDir::new().unwrap();
+        let dt = NaiveDate::from_ymd_opt(2026, 11, 13).unwrap();
+        let run_id = Uuid::new_v4();
+        let rows = sample_rows(run_id);
+
+        {
+            let mut writer = BronzeWriter::create(dir.path(), dt, "plazavea", run_id).unwrap();
+            writer.write_rows(&rows).unwrap();
+        }
+
+        let partition_dir = dir.path().join("dt=2026-11-13").join("retailer=plazavea");
+        let entries: Vec<_> = std::fs::read_dir(&partition_dir).unwrap().collect();
+        assert!(
+            entries.is_empty(),
+            "partition directory must contain no temp files after drop"
+        );
+    }
+
+    #[test]
+    fn bronze_writer_finish_cleans_temp_on_rename_error() {
+        let dir = TempDir::new().unwrap();
+        let dt = NaiveDate::from_ymd_opt(2026, 11, 13).unwrap();
+        let run_id = Uuid::new_v4();
+        let rows = sample_rows(run_id);
+
+        let mut writer = BronzeWriter::create(dir.path(), dt, "plazavea", run_id).unwrap();
+        writer.write_rows(&rows).unwrap();
+
+        let blocking_target = parquet_output_path(dir.path(), dt, "plazavea", run_id);
+        std::fs::create_dir_all(&blocking_target).unwrap();
+        std::fs::write(blocking_target.join("keep"), b"x").unwrap();
+
+        assert!(writer.finish().is_err());
+
+        let partition_dir = blocking_target.parent().unwrap();
+        let leftover_tmp: Vec<_> = std::fs::read_dir(partition_dir)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.file_name().to_string_lossy().contains(".tmp"))
+            .collect();
+        assert!(
+            leftover_tmp.is_empty(),
+            "temp file must be removed when finish rename fails"
+        );
     }
 }
