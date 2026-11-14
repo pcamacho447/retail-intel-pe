@@ -57,6 +57,114 @@ impl VtexAdapter {
             http,
         }
     }
+
+    pub fn parse_page(
+        &self,
+        body: &str,
+        ctx: &FetchContext,
+    ) -> anyhow::Result<(Vec<Product>, usize)> {
+        let parsed: Value = serde_json::from_str(body).with_context(|| {
+            let snippet: String = body.chars().take(200).collect();
+            format!(
+                "VTEX payload for {} is not valid JSON (http_status={}): snippet={snippet:?}",
+                self.retailer_slug(),
+                ctx.http_status
+            )
+        })?;
+
+        let items = parsed.as_array().ok_or_else(|| {
+            let snippet: String = body.chars().take(200).collect();
+            anyhow!(
+                "VTEX payload for {} expected JSON array (http_status={}): snippet={snippet:?}",
+                self.retailer_slug(),
+                ctx.http_status
+            )
+        })?;
+
+        let mut products = Vec::with_capacity(items.len());
+        let mut rejected = 0usize;
+        let volatile_keys = self.volatile_payload_keys();
+
+        for (idx, elem) in items.iter().enumerate() {
+            if !elem.is_object() {
+                tracing::warn!(
+                    retailer = self.retailer_slug(),
+                    index = idx,
+                    "Skipping non-object VTEX product element"
+                );
+                rejected += 1;
+                continue;
+            }
+            let Some(product_id) = value_as_string(elem.get("productId")) else {
+                tracing::warn!(
+                    retailer = self.retailer_slug(),
+                    index = idx,
+                    "Skipping VTEX product element missing valid productId"
+                );
+                rejected += 1;
+                continue;
+            };
+
+            let raw_payload = serde_json::to_string(elem)?;
+            let payload_hash = compute_payload_hash(&raw_payload);
+            let content_hash = compute_content_hash(&raw_payload, volatile_keys);
+            let raw_name = normalize_opt_string(
+                elem.get("productName")
+                    .or_else(|| elem.get("productTitle"))
+                    .and_then(|v| v.as_str()),
+            )
+            .unwrap_or_else(|| product_id.clone());
+
+            let brand = normalize_opt_string(elem.get("brand").and_then(|v| v.as_str()));
+            let category_path = elem
+                .get("categories")
+                .and_then(|v| v.as_array())
+                .and_then(|arr| arr.first())
+                .and_then(|v| v.as_str())
+                .and_then(|s| normalize_opt_string(Some(s)));
+            let raw_description =
+                normalize_opt_string(elem.get("description").and_then(|v| v.as_str()));
+            let product_url =
+                absolutize_url(&self.base_url, elem.get("link").and_then(|v| v.as_str()));
+
+            let skus = elem
+                .get("items")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|sku| parse_vtex_sku(sku, elem, &raw_name, self.retailer))
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            products.push(Product {
+                retailer: self.retailer_slug().to_string(),
+                market_id: ctx.market_id.clone(),
+                store_id: ctx.store_id.clone(),
+                product_id,
+                raw_name,
+                brand,
+                category_path,
+                raw_description,
+                product_url,
+                currency: ctx.currency.clone(),
+                sales_channel: ctx.sales_channel.clone(),
+                postal_code: ctx.postal_code.clone(),
+                scraped_at: ctx.scraped_at,
+                extraction_run_id: ctx.extraction_run_id,
+                extractor_version: self.extractor_version().to_string(),
+                source_endpoint: ctx.source_endpoint.clone(),
+                http_status: ctx.http_status,
+                payload_hash,
+                raw_payload,
+                query_term: ctx.query_term.clone(),
+                content_hash,
+                skus,
+            });
+        }
+
+        Ok((products, rejected))
+    }
 }
 
 fn positive_f64(val: Option<&Value>) -> Option<f64> {
@@ -367,6 +475,73 @@ fn vtex_availability(offer: &Value) -> AvailabilityObs {
     }
 }
 
+struct VtexSellerContext {
+    seller_id: Option<String>,
+    seller_name: Option<String>,
+    seller_count: Option<i32>,
+    is_default_seller: Option<bool>,
+    list_price: Option<f64>,
+    selling_price: Option<f64>,
+    card_price: Option<f64>,
+    card_program: Option<String>,
+    availability: AvailabilityObs,
+}
+
+fn extract_vtex_seller_context(
+    item: &Value,
+    sku_id: &str,
+    retailer: VtexRetailer,
+) -> VtexSellerContext {
+    let sellers = item.get("sellers").and_then(|v| v.as_array());
+    let seller_count = sellers.and_then(|arr| i32::try_from(arr.len()).ok());
+    let selected_seller = sellers.and_then(|arr| {
+        arr.iter()
+            .find(|s| s.get("sellerDefault").and_then(|v| v.as_bool()) == Some(true))
+            .or_else(|| arr.first())
+    });
+
+    let Some(seller) = selected_seller else {
+        return VtexSellerContext {
+            seller_id: None,
+            seller_name: None,
+            seller_count,
+            is_default_seller: None,
+            list_price: None,
+            selling_price: None,
+            card_price: None,
+            card_program: None,
+            availability: AvailabilityObs {
+                qty: None,
+                status: "unknown",
+                source: "none",
+            },
+        };
+    };
+
+    let seller_id = value_as_string(seller.get("sellerId"));
+    let seller_name = normalize_opt_string(seller.get("sellerName").and_then(|v| v.as_str()));
+    let is_default_seller =
+        Some(seller.get("sellerDefault").and_then(|v| v.as_bool()) == Some(true));
+    let offer = seller.get("commertialOffer").unwrap_or(&Value::Null);
+    let list_price = positive_f64(offer.get("ListPrice"));
+    let selling_price = positive_f64(offer.get("Price"));
+    let (card_price, card_program) =
+        extract_card_offer(offer, sku_id, list_price, selling_price, retailer);
+    let availability = vtex_availability(offer);
+
+    VtexSellerContext {
+        seller_id,
+        seller_name,
+        seller_count,
+        is_default_seller,
+        list_price,
+        selling_price,
+        card_price,
+        card_program,
+        availability,
+    }
+}
+
 fn parse_vtex_sku(
     item: &Value,
     product_elem: &Value,
@@ -390,64 +565,34 @@ fn parse_vtex_sku(
         .and_then(|v| v.as_str())
         .and_then(|s| normalize_opt_string(Some(s)));
 
-    let sellers = item.get("sellers").and_then(|v| v.as_array());
-    let selected_seller = sellers.and_then(|arr| {
-        arr.iter()
-            .find(|s| s.get("sellerDefault").and_then(|v| v.as_bool()) == Some(true))
-            .or_else(|| arr.first())
-    });
+    let measurement_unit =
+        normalize_opt_string(item.get("measurementUnit").and_then(|v| v.as_str()));
+    let unit_multiplier = item
+        .get("unitMultiplier")
+        .and_then(|v| v.as_f64())
+        .filter(|n| n.is_finite());
 
-    let (seller_id, list_price, selling_price, card_price, card_program, availability) =
-        if let Some(seller) = selected_seller {
-            let seller_id = value_as_string(seller.get("sellerId"));
-            let offer = seller.get("commertialOffer").unwrap_or(&Value::Null);
-            let list_price = positive_f64(offer.get("ListPrice"));
-            let selling_price = positive_f64(offer.get("Price"));
-            let (card_price, card_program) =
-                extract_card_offer(offer, &sku_id, list_price, selling_price, retailer);
-            let availability = vtex_availability(offer);
-            (
-                seller_id,
-                list_price,
-                selling_price,
-                card_price,
-                card_program,
-                availability,
-            )
-        } else {
-            (
-                None,
-                None,
-                None,
-                None,
-                None,
-                AvailabilityObs {
-                    qty: None,
-                    status: "unknown",
-                    source: "none",
-                },
-            )
-        };
+    let seller_ctx = extract_vtex_seller_context(item, &sku_id, retailer);
 
     Some(SkuItem {
         sku_id,
         ean,
         ean_source,
-        availability_status: availability.status.to_string(),
-        availability_source: availability.source.to_string(),
-        seller_id,
-        seller_name: None,
-        seller_count: None,
-        is_default_seller: None,
-        measurement_unit: None,
-        unit_multiplier: None,
+        availability_status: seller_ctx.availability.status.to_string(),
+        availability_source: seller_ctx.availability.source.to_string(),
+        seller_id: seller_ctx.seller_id,
+        seller_name: seller_ctx.seller_name,
+        seller_count: seller_ctx.seller_count,
+        is_default_seller: seller_ctx.is_default_seller,
+        measurement_unit,
+        unit_multiplier,
         raw_name,
         image_url,
-        list_price,
-        selling_price,
-        card_price,
-        card_program,
-        available_qty: availability.qty,
+        list_price: seller_ctx.list_price,
+        selling_price: seller_ctx.selling_price,
+        card_price: seller_ctx.card_price,
+        card_program: seller_ctx.card_program,
+        available_qty: seller_ctx.availability.qty,
     })
 }
 
@@ -492,92 +637,7 @@ impl RetailerAdapter for VtexAdapter {
     }
 
     fn parse_page_payload(&self, body: &str, ctx: &FetchContext) -> anyhow::Result<Vec<Product>> {
-        let parsed: Value = serde_json::from_str(body).with_context(|| {
-            let snippet: String = body.chars().take(200).collect();
-            format!(
-                "VTEX payload for {} is not valid JSON (http_status={}): snippet={snippet:?}",
-                self.retailer_slug(),
-                ctx.http_status
-            )
-        })?;
-
-        let items = parsed.as_array().ok_or_else(|| {
-            let snippet: String = body.chars().take(200).collect();
-            anyhow!(
-                "VTEX payload for {} expected JSON array (http_status={}): snippet={snippet:?}",
-                self.retailer_slug(),
-                ctx.http_status
-            )
-        })?;
-
-        let mut products = Vec::with_capacity(items.len());
-        let volatile_keys = self.volatile_payload_keys();
-        for elem in items {
-            let raw_payload = serde_json::to_string(elem)?;
-            let payload_hash = compute_payload_hash(&raw_payload);
-            let content_hash = compute_content_hash(&raw_payload, volatile_keys);
-            let product_id = value_as_string(elem.get("productId")).ok_or_else(|| {
-                anyhow!(
-                    "VTEX product object missing productId (retailer={})",
-                    self.retailer_slug()
-                )
-            })?;
-            let raw_name = normalize_opt_string(
-                elem.get("productName")
-                    .or_else(|| elem.get("productTitle"))
-                    .and_then(|v| v.as_str()),
-            )
-            .unwrap_or_else(|| product_id.clone());
-
-            let brand = normalize_opt_string(elem.get("brand").and_then(|v| v.as_str()));
-            let category_path = elem
-                .get("categories")
-                .and_then(|v| v.as_array())
-                .and_then(|arr| arr.first())
-                .and_then(|v| v.as_str())
-                .and_then(|s| normalize_opt_string(Some(s)));
-            let raw_description =
-                normalize_opt_string(elem.get("description").and_then(|v| v.as_str()));
-            let product_url =
-                absolutize_url(&self.base_url, elem.get("link").and_then(|v| v.as_str()));
-
-            let skus = elem
-                .get("items")
-                .and_then(|v| v.as_array())
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|sku| parse_vtex_sku(sku, elem, &raw_name, self.retailer))
-                        .collect()
-                })
-                .unwrap_or_default();
-
-            products.push(Product {
-                retailer: self.retailer_slug().to_string(),
-                market_id: ctx.market_id.clone(),
-                store_id: ctx.store_id.clone(),
-                product_id,
-                raw_name,
-                brand,
-                category_path,
-                raw_description,
-                product_url,
-                currency: ctx.currency.clone(),
-                sales_channel: ctx.sales_channel.clone(),
-                postal_code: ctx.postal_code.clone(),
-                scraped_at: ctx.scraped_at,
-                extraction_run_id: ctx.extraction_run_id,
-                extractor_version: self.extractor_version().to_string(),
-                source_endpoint: ctx.source_endpoint.clone(),
-                http_status: ctx.http_status,
-                payload_hash,
-                raw_payload,
-                query_term: ctx.query_term.clone(),
-                content_hash,
-                skus,
-            });
-        }
-
-        Ok(products)
+        self.parse_page(body, ctx).map(|(products, _)| products)
     }
 
     async fn fetch_page(
@@ -591,18 +651,18 @@ impl RetailerAdapter for VtexAdapter {
         let url = self.build_page_url(category_or_query, offset, effective_size);
         let resp = self.http.get_text(&url).await?;
         let page_ctx = ctx.clone().with_endpoint(url, resp.status);
-        let products = self.parse_page_payload(&resp.body, &page_ctx)?;
-        let count = products.len();
-        let has_more = count > 0 && count >= effective_size;
+        let (products, products_rejected) = self.parse_page(&resp.body, &page_ctx)?;
+        let raw_count = products.len() + products_rejected;
+        let has_more = raw_count > 0 && raw_count >= effective_size;
 
         Ok(PageBatch {
             products,
             has_more,
-            next_offset: offset + count,
+            next_offset: offset + raw_count,
             raw_bytes: resp.bytes,
             http_status: resp.status,
             latency_ms: resp.latency_ms,
-            products_rejected: 0,
+            products_rejected,
         })
     }
 }
@@ -1702,5 +1762,227 @@ mod tests {
         assert_eq!(products[1].skus[0].available_qty, None);
         assert_eq!(products[1].skus[0].availability_status, "in_stock");
         assert_eq!(products[1].skus[0].availability_source, "vtex_offer");
+    }
+
+    #[test]
+    fn vtex_weighted_item_exposes_measurement_unit_and_multiplier_without_touching_price() {
+        let fixture = r#"[
+          {
+            "productId": "9101",
+            "productName": "Papa Amarilla a Granel",
+            "items": [{
+              "itemId": "91011",
+              "name": "Papa Amarilla",
+              "measurementUnit": "kg",
+              "unitMultiplier": 0.1,
+              "sellers": [{
+                "sellerId": "1",
+                "sellerName": "PlazaVea",
+                "sellerDefault": true,
+                "commertialOffer": {
+                  "ListPrice": 49.9,
+                  "Price": 49.9,
+                  "AvailableQuantity": 15
+                }
+              }]
+            }]
+          },
+          {
+            "productId": "9102",
+            "productName": "Arroz Sin Unidad",
+            "items": [{
+              "itemId": "91021",
+              "name": "Arroz",
+              "measurementUnit": "   ",
+              "sellers": []
+            }]
+          }
+        ]"#;
+
+        let adapter = VtexAdapter::new(VtexRetailer::PlazaVea, test_http());
+        let ctx = FetchContext::for_run(Uuid::new_v4(), "PE", None);
+        let products = adapter.parse_page_payload(fixture, &ctx).unwrap();
+
+        let sku = &products[0].skus[0];
+        assert_eq!(sku.measurement_unit.as_deref(), Some("kg"));
+        assert_eq!(sku.unit_multiplier, Some(0.1));
+        assert_eq!(sku.list_price, Some(49.9));
+        assert_eq!(sku.selling_price, Some(49.9));
+
+        let sku_blank = &products[1].skus[0];
+        assert_eq!(sku_blank.measurement_unit, None);
+        assert_eq!(sku_blank.unit_multiplier, None);
+    }
+
+    #[test]
+    fn vtex_seller_fields_and_count() {
+        let with_default = r#"[
+          {
+            "productId": "9201",
+            "productName": "Aceite Vegetal",
+            "items": [{
+              "itemId": "92011",
+              "name": "Aceite 1L",
+              "sellers": [
+                {
+                  "sellerId": "a",
+                  "sellerName": "A",
+                  "commertialOffer": { "ListPrice": 12.0, "Price": 11.0, "AvailableQuantity": 2 }
+                },
+                {
+                  "sellerId": "1",
+                  "sellerName": "Metro",
+                  "sellerDefault": true,
+                  "commertialOffer": { "ListPrice": 10.5, "Price": 9.9, "AvailableQuantity": 8 }
+                }
+              ]
+            }]
+          }
+        ]"#;
+
+        let without_default = r#"[
+          {
+            "productId": "9201",
+            "productName": "Aceite Vegetal",
+            "items": [{
+              "itemId": "92011",
+              "name": "Aceite 1L",
+              "sellers": [
+                {
+                  "sellerId": "a",
+                  "sellerName": "A",
+                  "commertialOffer": { "ListPrice": 12.0, "Price": 11.0, "AvailableQuantity": 2 }
+                },
+                {
+                  "sellerId": "1",
+                  "sellerName": "Metro",
+                  "commertialOffer": { "ListPrice": 10.5, "Price": 9.9, "AvailableQuantity": 8 }
+                }
+              ]
+            }]
+          }
+        ]"#;
+
+        let empty_and_absent = r#"[
+          {
+            "productId": "9202",
+            "productName": "Sin Sellers",
+            "items": [
+              {
+                "itemId": "92021",
+                "name": "Empty sellers",
+                "sellers": []
+              },
+              {
+                "itemId": "92022",
+                "name": "Absent sellers"
+              }
+            ]
+          }
+        ]"#;
+
+        let adapter = VtexAdapter::new(VtexRetailer::Metro, test_http());
+        let ctx = FetchContext::for_run(Uuid::new_v4(), "PE", None);
+
+        let p_default = adapter.parse_page_payload(with_default, &ctx).unwrap();
+        let sku = &p_default[0].skus[0];
+        assert_eq!(sku.seller_id.as_deref(), Some("1"));
+        assert_eq!(sku.seller_name.as_deref(), Some("Metro"));
+        assert_eq!(sku.seller_count, Some(2));
+        assert_eq!(sku.is_default_seller, Some(true));
+        assert_eq!(sku.selling_price, Some(9.9));
+
+        let p_fallback = adapter.parse_page_payload(without_default, &ctx).unwrap();
+        let sku_fallback = &p_fallback[0].skus[0];
+        assert_eq!(sku_fallback.seller_id.as_deref(), Some("a"));
+        assert_eq!(sku_fallback.seller_name.as_deref(), Some("A"));
+        assert_eq!(sku_fallback.seller_count, Some(2));
+        assert_eq!(sku_fallback.is_default_seller, Some(false));
+        assert_eq!(sku_fallback.selling_price, Some(11.0));
+
+        let p_none = adapter.parse_page_payload(empty_and_absent, &ctx).unwrap();
+        let sku_empty = &p_none[0].skus[0];
+        assert_eq!(sku_empty.seller_id, None);
+        assert_eq!(sku_empty.seller_name, None);
+        assert_eq!(sku_empty.seller_count, Some(0));
+        assert_eq!(sku_empty.is_default_seller, None);
+
+        let sku_absent = &p_none[0].skus[1];
+        assert_eq!(sku_absent.seller_id, None);
+        assert_eq!(sku_absent.seller_name, None);
+        assert_eq!(sku_absent.seller_count, None);
+        assert_eq!(sku_absent.is_default_seller, None);
+    }
+
+    #[test]
+    fn vtex_page_skips_product_without_product_id_and_counts_rejection() {
+        let body = r#"[
+          {"productId": "1", "productName": "Producto Valido", "items": [{"itemId": "11", "name": "SKU 1", "sellers": []}]},
+          {"productName": "sin id"}
+        ]"#;
+        let adapter = VtexAdapter::new(VtexRetailer::PlazaVea, test_http());
+        let ctx = FetchContext::for_run(Uuid::new_v4(), "PE", None);
+
+        let (products, rejected) = adapter.parse_page(body, &ctx).unwrap();
+        assert_eq!((products.len(), rejected), (1, 1));
+        assert_eq!(products[0].product_id, "1");
+    }
+
+    #[test]
+    fn vtex_page_skips_blank_product_id_and_non_object_elements_and_fails_on_non_array() {
+        let body = r#"[
+          {"productId": "10", "productName": "Ok", "items": []},
+          {"productId": "   ", "productName": "Blank ID"},
+          null,
+          "not-an-object"
+        ]"#;
+        let adapter = VtexAdapter::new(VtexRetailer::Wong, test_http());
+        let ctx = FetchContext::for_run(Uuid::new_v4(), "PE", None);
+
+        let (products, rejected) = adapter.parse_page(body, &ctx).unwrap();
+        assert_eq!((products.len(), rejected), (1, 3));
+        assert_eq!(products[0].product_id, "10");
+
+        let trait_products = adapter.parse_page_payload(body, &ctx).unwrap();
+        assert_eq!(trait_products.len(), 1);
+        assert_eq!(trait_products[0].product_id, "10");
+
+        assert!(adapter
+            .parse_page(r#"{"error":"not an array"}"#, &ctx)
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn vtex_fetch_page_records_rejected_and_paginates_by_raw_count() {
+        let body = r#"[
+          {"productId": "1", "productName": "Valido", "items": [{"itemId": "11", "name": "Valido", "sellers": []}]},
+          {"productName": "sin id"}
+        ]"#;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = socket.read(&mut buf).await;
+            let resp = format!(
+                "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = socket.write_all(resp.as_bytes()).await;
+        });
+
+        let adapter = VtexAdapter::with_base_url(
+            VtexRetailer::PlazaVea,
+            format!("http://{addr}"),
+            test_http(),
+        );
+        let ctx = FetchContext::for_run(Uuid::new_v4(), "PE", None);
+        let batch = adapter.fetch_page("lacteos", 10, 2, &ctx).await.unwrap();
+
+        assert_eq!(batch.products.len(), 1);
+        assert_eq!(batch.products_rejected, 1);
+        assert!(batch.has_more);
+        assert_eq!(batch.next_offset, 12);
     }
 }
