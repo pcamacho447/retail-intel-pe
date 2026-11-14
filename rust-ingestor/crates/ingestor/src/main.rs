@@ -62,6 +62,7 @@ pub struct Cli {
     #[arg(long, default_value = "PE")]
     pub market_id: String,
 
+    /// Requested postal code recorded in run metrics for traceability; only sent and stamped on Bronze rows when the adapter supports geo context (applies_geo_context)
     #[arg(long)]
     pub postal_code: Option<String>,
 
@@ -285,5 +286,14 @@ mod tests {
         let http = Arc::new(RateLimitedHttpClient::new().unwrap());
         let adapter = build_adapter_for_cli(&enriched_cli, http);
         assert_eq!(adapter.retailer_slug(), "tottus");
+    }
+
+    #[test]
+    fn postal_code_help_explains_geo_context_gating() {
+        use clap::CommandFactory;
+        let help = Cli::command().render_long_help().to_string();
+        assert!(help.contains("--postal-code"));
+        assert!(help.contains("applies_geo_context"));
+        assert!(help.contains("traceability"));
     }
 }

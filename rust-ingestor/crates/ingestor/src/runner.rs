@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use anyhow::Context;
-use chrono::Utc;
+use chrono::{DateTime, FixedOffset, NaiveDate, TimeDelta, Utc};
 use uuid::Uuid;
 
 use crate::adapter::{FetchContext, RetailerAdapter};
@@ -12,6 +12,16 @@ use crate::domain::BronzeSkuRow;
 use crate::http::RateLimitedHttpClient;
 use crate::metrics::{read_peak_ram_mb, RunMetrics};
 use crate::storage::parquet_writer::write_bronze_parquet;
+
+const LIMA_UTC_OFFSET_SECS: i32 = 5 * 3600;
+
+/// Returns the Peru business date (`UTC-5` fixed, no DST) for the given UTC instant.
+pub fn business_date_lima(now: DateTime<Utc>) -> NaiveDate {
+    match FixedOffset::west_opt(LIMA_UTC_OFFSET_SECS) {
+        Some(lima_offset) => now.with_timezone(&lima_offset).date_naive(),
+        None => (now - TimeDelta::hours(5)).date_naive(),
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct IngestConfig {
@@ -33,16 +43,31 @@ pub async fn run_ingest(
     let started_at = Instant::now();
     let started_utc = Utc::now();
     let extraction_run_id = Uuid::new_v4();
-    let run_date = Utc::now().date_naive();
+    let run_date = business_date_lima(started_utc);
+    let business_date = run_date.format("%Y-%m-%d").to_string();
     let slug = adapter.retailer_slug();
 
     let mut dedup = PayloadDeduplicator::open(&config.output_dir)?;
     let checkpoints = CheckpointStore::new(&config.output_dir);
 
+    let requested_postal_code = config.postal_code.clone();
+    let applied_postal_code = if adapter.applies_geo_context() {
+        requested_postal_code.clone()
+    } else {
+        if let Some(postal_code) = requested_postal_code.as_deref() {
+            tracing::warn!(
+                retailer = slug,
+                requested_postal_code = %postal_code,
+                "Requested postal_code was not applied because adapter does not support geo context"
+            );
+        }
+        None
+    };
+
     let base_ctx = FetchContext::for_run(
         extraction_run_id,
         config.market_id.clone(),
-        config.postal_code.clone(),
+        applied_postal_code,
     );
 
     let mut all_rows: Vec<BronzeSkuRow> = Vec::new();
@@ -182,6 +207,8 @@ pub async fn run_ingest(
         categories: config.categories.clone(),
         started_at: started_utc,
         finished_at: Utc::now(),
+        business_date,
+        requested_postal_code,
         status: status.to_string(),
         error: error_msg,
         products_recovered,
@@ -206,6 +233,8 @@ pub async fn run_ingest(
         extraction_run_id = %metrics.extraction_run_id,
         retailer = %metrics.retailer,
         extractor_version = %metrics.extractor_version,
+        business_date = %metrics.business_date,
+        requested_postal_code = ?metrics.requested_postal_code,
         status = %metrics.status,
         products_recovered = metrics.products_recovered,
         skus_recovered = metrics.skus_recovered,
@@ -235,7 +264,7 @@ mod tests {
     use crate::adapters::vtex::{VtexAdapter, VtexRetailer};
     use crate::checkpoint::{CheckpointState, CheckpointStore};
     use arrow::array::{Array, BooleanArray, StringArray};
-    use chrono::Utc;
+    use chrono::TimeZone;
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
     use std::fs::File;
     use std::num::NonZeroU32;
@@ -452,6 +481,11 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert_eq!(metrics.pages_fetched, 1);
         assert_eq!(metrics.products_recovered, 1);
+        assert_eq!(metrics.requested_postal_code, None);
+        assert_eq!(
+            metrics.business_date,
+            business_date_lima(metrics.started_at).to_string()
+        );
 
         let updated_cp = store.load("metro", "pending_cat").unwrap().unwrap();
         assert!(updated_cp.completed);
@@ -496,7 +530,7 @@ mod tests {
     #[tokio::test]
     async fn run_ingest_does_not_persist_dedup_or_checkpoints_if_parquet_write_fails() {
         let dir = TempDir::new().unwrap();
-        let run_date = Utc::now().date_naive();
+        let run_date = business_date_lima(Utc::now());
         let blocking_file = dir
             .path()
             .join(format!("dt={}", run_date.format("%Y-%m-%d")));
@@ -600,5 +634,220 @@ mod tests {
         assert_eq!(lacteos_cp.page_size, Some(10));
         let abarrotes_cp = store.load("metro", "abarrotes").unwrap().unwrap();
         assert_eq!(abarrotes_cp.page_size, Some(25));
+    }
+
+    fn read_parquet_postal_codes(path: &std::path::Path) -> Vec<Option<String>> {
+        let file = File::open(path).unwrap();
+        let reader = ParquetRecordBatchReaderBuilder::try_new(file)
+            .unwrap()
+            .build()
+            .unwrap();
+        let mut values = Vec::new();
+        for batch in reader {
+            let batch = batch.unwrap();
+            let col = batch
+                .column_by_name("postal_code")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            for row in 0..batch.num_rows() {
+                values.push((!col.is_null(row)).then(|| col.value(row).to_string()));
+            }
+        }
+        values
+    }
+
+    #[derive(Clone, Default)]
+    struct SharedLogBuffer(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for SharedLogBuffer {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for SharedLogBuffer {
+        type Writer = SharedLogBuffer;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    fn install_warn_log_capture() -> (SharedLogBuffer, tracing::subscriber::DefaultGuard) {
+        let log_buf = SharedLogBuffer::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .with_writer(log_buf.clone())
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+        (log_buf, guard)
+    }
+
+    struct GeoAwareVtexAdapter(VtexAdapter);
+
+    #[async_trait::async_trait]
+    impl RetailerAdapter for GeoAwareVtexAdapter {
+        fn retailer_slug(&self) -> &'static str {
+            self.0.retailer_slug()
+        }
+
+        fn extractor_version(&self) -> &'static str {
+            self.0.extractor_version()
+        }
+
+        fn build_page_url(
+            &self,
+            category_or_query: &str,
+            offset: usize,
+            page_size: usize,
+        ) -> String {
+            self.0.build_page_url(category_or_query, offset, page_size)
+        }
+
+        fn parse_page_payload(
+            &self,
+            body: &str,
+            ctx: &FetchContext,
+        ) -> anyhow::Result<Vec<crate::domain::Product>> {
+            self.0.parse_page_payload(body, ctx)
+        }
+
+        async fn fetch_page(
+            &self,
+            category_or_query: &str,
+            offset: usize,
+            page_size: usize,
+            ctx: &FetchContext,
+        ) -> anyhow::Result<crate::adapter::PageBatch> {
+            self.0
+                .fetch_page(category_or_query, offset, page_size, ctx)
+                .await
+        }
+
+        fn volatile_payload_keys(&self) -> &'static [&'static str] {
+            self.0.volatile_payload_keys()
+        }
+
+        fn applies_geo_context(&self) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn business_date_lima_uses_utc_minus_5() {
+        let d = |h, m| business_date_lima(Utc.with_ymd_and_hms(2026, 11, 14, h, m, 0).unwrap());
+        assert_eq!(d(3, 10), NaiveDate::from_ymd_opt(2026, 11, 13).unwrap());
+        assert_eq!(d(4, 59), NaiveDate::from_ymd_opt(2026, 11, 13).unwrap());
+        assert_eq!(d(5, 0), NaiveDate::from_ymd_opt(2026, 11, 14).unwrap());
+        assert_eq!(d(23, 59), NaiveDate::from_ymd_opt(2026, 11, 14).unwrap());
+        assert_eq!(
+            business_date_lima(Utc.with_ymd_and_hms(2026, 1, 1, 4, 59, 59).unwrap()),
+            NaiveDate::from_ymd_opt(2025, 12, 31).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn run_ingest_does_not_stamp_unapplied_postal_code() {
+        let dir = TempDir::new().unwrap();
+        let prod_json = r#"[{"productId":"20402646","productName":"Leche Gloria","brand":"Gloria","items":[{"itemId":"1001","ean":"7750243012345","name":"Leche Gloria 390g","sellers":[{"sellerId":"1","commertialOffer":{"ListPrice":4.5,"Price":4.2,"AvailableQuantity":20}}]},{"itemId":"1002","ean":"7750243012346","name":"Leche Gloria Pack","sellers":[{"sellerId":"1","commertialOffer":{"ListPrice":25.0,"Price":23.5,"AvailableQuantity":5}}]}]}]"#;
+        let (base_url, _) = spawn_vtex_sequence(vec![(200, prod_json.to_string())]).await;
+
+        let http = fast_http();
+        let adapter = VtexAdapter::with_base_url(VtexRetailer::PlazaVea, &base_url, http.clone());
+        assert!(!adapter.applies_geo_context());
+
+        let cfg = IngestConfig {
+            retailer: "plazavea".to_string(),
+            categories: vec!["lacteos".to_string()],
+            page_size: 20,
+            max_pages: 1,
+            output_dir: dir.path().to_path_buf(),
+            resume: false,
+            market_id: "PE".to_string(),
+            postal_code: Some("150101".to_string()),
+        };
+
+        let (log_buf, _guard) = install_warn_log_capture();
+
+        let metrics = run_ingest(&adapter, &http, &cfg).await.unwrap();
+        assert_eq!(metrics.requested_postal_code.as_deref(), Some("150101"));
+        assert_eq!(
+            metrics.business_date,
+            business_date_lima(metrics.started_at).to_string()
+        );
+        assert!(
+            metrics
+                .parquet_path
+                .contains(&format!("dt={}", metrics.business_date)),
+            "expected parquet_path {} to use dt={}",
+            metrics.parquet_path,
+            metrics.business_date
+        );
+
+        let postal_codes = read_parquet_postal_codes(std::path::Path::new(&metrics.parquet_path));
+        assert_eq!(postal_codes, vec![None, None]);
+
+        let metrics_path = PathBuf::from(&metrics.parquet_path)
+            .parent()
+            .unwrap()
+            .join(format!("metrics-{}.json", metrics.extraction_run_id));
+        let reloaded: RunMetrics =
+            serde_json::from_str(&std::fs::read_to_string(&metrics_path).unwrap()).unwrap();
+        assert_eq!(reloaded.requested_postal_code.as_deref(), Some("150101"));
+        assert_eq!(reloaded.business_date, metrics.business_date);
+
+        let logs = String::from_utf8_lossy(&log_buf.0.lock().unwrap()).to_string();
+        assert!(
+            logs.contains("150101") && logs.contains("not applied"),
+            "expected warning about unapplied postal_code, got logs: {logs}"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_ingest_stamps_postal_code_when_adapter_applies_geo_context() {
+        let dir = TempDir::new().unwrap();
+        let prod_json = r#"[{"productId":"20402646","productName":"Leche Gloria","brand":"Gloria","items":[{"itemId":"1001","ean":"7750243012345","name":"Leche Gloria 390g","sellers":[{"sellerId":"1","commertialOffer":{"ListPrice":4.5,"Price":4.2,"AvailableQuantity":20}}]}]}]"#;
+        let (base_url, _) = spawn_vtex_sequence(vec![(200, prod_json.to_string())]).await;
+
+        let http = fast_http();
+        let adapter = GeoAwareVtexAdapter(VtexAdapter::with_base_url(
+            VtexRetailer::PlazaVea,
+            &base_url,
+            http.clone(),
+        ));
+        assert!(adapter.applies_geo_context());
+
+        let cfg = IngestConfig {
+            retailer: "plazavea".to_string(),
+            categories: vec!["lacteos".to_string()],
+            page_size: 20,
+            max_pages: 1,
+            output_dir: dir.path().to_path_buf(),
+            resume: false,
+            market_id: "PE".to_string(),
+            postal_code: Some("150101".to_string()),
+        };
+
+        let (log_buf, _guard) = install_warn_log_capture();
+
+        let metrics = run_ingest(&adapter, &http, &cfg).await.unwrap();
+        assert_eq!(metrics.requested_postal_code.as_deref(), Some("150101"));
+
+        let postal_codes = read_parquet_postal_codes(std::path::Path::new(&metrics.parquet_path));
+        assert_eq!(postal_codes, vec![Some("150101".to_string())]);
+
+        let logs = String::from_utf8_lossy(&log_buf.0.lock().unwrap()).to_string();
+        assert!(
+            logs.is_empty(),
+            "expected no unapplied postal_code warning when adapter applies geo context, got: {logs}"
+        );
     }
 }
