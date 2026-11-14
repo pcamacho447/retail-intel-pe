@@ -1,4 +1,3 @@
-use std::fmt::Write;
 use std::sync::Arc;
 
 use anyhow::{anyhow, Context};
@@ -651,19 +650,7 @@ impl RetailerAdapter for VtexAdapter {
         ctx: &FetchContext,
     ) -> anyhow::Result<PageBatch> {
         let effective_size = page_size.clamp(1, 50);
-        let mut url = self.build_page_url(category_or_query, offset, effective_size);
-        if let Some(ref pc) = ctx.postal_code {
-            if !url.contains("_postalCode=") {
-                let sep = if url.contains('?') { '&' } else { '?' };
-                let _ = write!(url, "{sep}_postalCode={}", encode_url_segment(pc));
-            }
-        }
-        if let Some(ref sid) = ctx.store_id {
-            if !url.contains("_storeId=") {
-                let sep = if url.contains('?') { '&' } else { '?' };
-                let _ = write!(url, "{sep}_storeId={}", encode_url_segment(sid));
-            }
-        }
+        let url = self.build_page_url(category_or_query, offset, effective_size);
         let resp = self.http.get_text(&url).await?;
         let page_ctx = ctx.clone().with_endpoint(url, resp.status);
         let (products, products_rejected) = self.parse_page(&resp.body, &page_ctx)?;
@@ -1177,7 +1164,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn vtex_fetch_page_appends_postal_code_and_store_id_to_endpoint() {
+    async fn vtex_fetch_page_does_not_send_unverified_geo_params() {
         let body = r#"[{"productId":"1","productName":"Item 1","items":[{"itemId":"11","name":"Item 1","sellers":[]}]}]"#;
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1209,22 +1196,22 @@ mod tests {
 
         let req = req_rx.recv().await.unwrap();
         assert!(
-            req.contains("_postalCode=15001"),
-            "request missing _postalCode: {req}"
+            !req.contains("_postalCode="),
+            "request unexpectedly sent _postalCode: {req}"
         );
         assert!(
-            req.contains("_storeId=TIENDA_1"),
-            "request missing _storeId: {req}"
+            !req.contains("_storeId="),
+            "request unexpectedly sent _storeId: {req}"
         );
 
         let endpoint = &batch.products[0].source_endpoint;
         assert!(
-            endpoint.contains("_postalCode=15001"),
-            "product endpoint missing _postalCode: {endpoint}"
+            !endpoint.contains("_postalCode="),
+            "product endpoint unexpectedly sent _postalCode: {endpoint}"
         );
         assert!(
-            endpoint.contains("_storeId=TIENDA_1"),
-            "product endpoint missing _storeId: {endpoint}"
+            !endpoint.contains("_storeId="),
+            "product endpoint unexpectedly sent _storeId: {endpoint}"
         );
     }
 

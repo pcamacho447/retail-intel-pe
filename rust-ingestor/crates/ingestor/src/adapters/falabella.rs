@@ -1,5 +1,4 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::fmt::Write;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -891,19 +890,7 @@ impl RetailerAdapter for FalabellaListingAdapter {
         page_size: usize,
         ctx: &FetchContext,
     ) -> anyhow::Result<PageBatch> {
-        let mut url = self.build_page_url(category_or_query, offset, page_size);
-        if let Some(ref pc) = ctx.postal_code {
-            if !url.contains("postalCode=") {
-                let sep = if url.contains('?') { '&' } else { '?' };
-                let _ = write!(url, "{sep}postalCode={}", encode_url_segment(pc));
-            }
-        }
-        if let Some(ref sid) = ctx.store_id {
-            if !url.contains("storeId=") {
-                let sep = if url.contains('?') { '&' } else { '?' };
-                let _ = write!(url, "{sep}storeId={}", encode_url_segment(sid));
-            }
-        }
+        let url = self.build_page_url(category_or_query, offset, page_size);
         let resp = self.http.get_text(&url).await?;
         let page_ctx = ctx.clone().with_endpoint(url, resp.status);
         let root = extract_next_data_json(&resp.body, resp.status)?;
@@ -1342,7 +1329,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn falabella_fetch_page_appends_postal_code_and_store_id_to_endpoint() {
+    async fn falabella_fetch_page_does_not_send_unverified_geo_params() {
         let body = r#"<html><script id="__NEXT_DATA__" type="application/json">{
           "props": {
             "pageProps": {
@@ -1380,22 +1367,22 @@ mod tests {
 
         let req = req_rx.recv().await.unwrap();
         assert!(
-            req.contains("postalCode=15001"),
-            "request missing postalCode: {req}"
+            !req.contains("postalCode="),
+            "request unexpectedly sent postalCode: {req}"
         );
         assert!(
-            req.contains("storeId=TIENDA_1"),
-            "request missing storeId: {req}"
+            !req.contains("storeId="),
+            "request unexpectedly sent storeId: {req}"
         );
 
         let endpoint = &batch.products[0].source_endpoint;
         assert!(
-            endpoint.contains("postalCode=15001"),
-            "product endpoint missing postalCode: {endpoint}"
+            !endpoint.contains("postalCode="),
+            "product endpoint unexpectedly sent postalCode: {endpoint}"
         );
         assert!(
-            endpoint.contains("storeId=TIENDA_1"),
-            "product endpoint missing storeId: {endpoint}"
+            !endpoint.contains("storeId="),
+            "product endpoint unexpectedly sent storeId: {endpoint}"
         );
     }
 
