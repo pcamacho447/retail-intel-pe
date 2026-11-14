@@ -13,7 +13,7 @@ use tokio::sync::Mutex;
 use crate::adapter::{FetchContext, PageBatch, RetailerAdapter};
 use crate::adapters::{absolutize_url, encode_url_segment, value_as_string};
 use crate::dedup::{compute_content_hash, compute_payload_hash};
-use crate::domain::{normalize_opt_string, validate_gtin_mod10, Product, SkuItem};
+use crate::domain::{normalize_opt_string, validate_gtin_mod10, AvailabilityObs, Product, SkuItem};
 use crate::http::RateLimitedHttpClient;
 
 const TOTTUS_BASE_URL: &str = "https://tottus.falabella.com.pe";
@@ -207,11 +207,6 @@ impl FalabellaListingAdapter {
                         if let Some(ean) = entry.ean.as_deref().and_then(validate_gtin_mod10) {
                             sku.ean = Some(ean);
                             sku.ean_source = Some("pdp".to_string());
-                        }
-                    }
-                    if sku.available_qty != Some(0) {
-                        if let Some(qty) = entry.available_qty {
-                            sku.available_qty = Some(qty);
                         }
                     }
                 }
@@ -409,29 +404,35 @@ fn parse_non_negative_i64(val: &Value) -> Option<i64> {
         })
 }
 
-pub fn extract_tottus_listing_stock(item: &Value, selling_price: Option<f64>) -> Option<i64> {
+pub fn extract_tottus_listing_availability(item: &Value) -> AvailabilityObs {
     let out_of_stock = item.get("isOutOfStock").and_then(|v| v.as_bool()) == Some(true)
         || item
             .pointer("/availability/isOutOfStock")
             .and_then(|v| v.as_bool())
             == Some(true);
     if out_of_stock {
-        return Some(0);
+        return AvailabilityObs {
+            qty: Some(0),
+            status: "out_of_stock",
+            source: "tottus_listing_flag",
+        };
     }
 
-    for field in ["availableQuantity", "stock", "maxOnCartAmount"] {
+    for field in ["availableQuantity", "stock"] {
         if let Some(qty) = item.get(field).and_then(parse_non_negative_i64) {
-            return Some(qty);
+            return AvailabilityObs {
+                qty: Some(qty),
+                status: if qty > 0 { "in_stock" } else { "out_of_stock" },
+                source: "tottus_listing_qty",
+            };
         }
     }
 
-    let has_offer_signal = item.get("offeringId").is_some_and(|v| !v.is_null())
-        || item.get("availability").is_some_and(|v| !v.is_null());
-    if selling_price.is_some() && has_offer_signal {
-        return Some(1);
+    AvailabilityObs {
+        qty: None,
+        status: "listed_unknown",
+        source: "tottus_listing_presence",
     }
-
-    None
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -535,24 +536,15 @@ fn parse_json_ld_availability(offers: &Value) -> Option<bool> {
 
 fn extract_variant_stock_limit(variant: &Value) -> Option<i64> {
     variant
-        .get("maxOnCartAmount")
+        .pointer("/qtyLimits/value")
         .and_then(parse_positive_i64)
-        .or_else(|| {
-            variant
-                .pointer("/qtyLimits/value")
-                .and_then(parse_positive_i64)
-        })
         .or_else(|| {
             variant
                 .get("offerings")
                 .and_then(|o| o.as_array())
                 .and_then(|arr| {
                     arr.iter().find_map(|off| {
-                        off.get("maxOnCartAmount")
-                            .and_then(parse_positive_i64)
-                            .or_else(|| {
-                                off.pointer("/qtyLimits/value").and_then(parse_positive_i64)
-                            })
+                        off.pointer("/qtyLimits/value").and_then(parse_positive_i64)
                     })
                 })
         })
@@ -613,13 +605,12 @@ pub fn parse_tottus_pdp_html(html: &str, target_sku_id: &str) -> TottusPdpEnrich
     let available_qty = if in_stock == Some(false) {
         Some(0)
     } else {
-        let positive_limit = matched_variant
+        matched_variant
             .and_then(extract_variant_stock_limit)
             .or_else(|| {
                 product_data.and_then(|pd| {
-                    pd.get("maxOnCartAmount")
+                    pd.pointer("/qtyLimits/value")
                         .and_then(parse_positive_i64)
-                        .or_else(|| pd.pointer("/qtyLimits/value").and_then(parse_positive_i64))
                         .or_else(|| {
                             let stock_units = pd.get("stockUnits")?;
                             let variant_id = matched_variant.and_then(|v| {
@@ -637,12 +628,7 @@ pub fn parse_tottus_pdp_html(html: &str, target_sku_id: &str) -> TottusPdpEnrich
                                 })
                         })
                 })
-            });
-
-        positive_limit.or(match in_stock {
-            Some(true) => Some(1),
-            _ => None,
-        })
+            })
     };
 
     let seller_sku_id = matched_variant
@@ -740,7 +726,7 @@ fn parse_results_from_root(
         let (list_price, selling_price, card_price, card_program) = extract_falabella_prices(item);
         let ean = extract_tottus_listing_ean(item);
         let ean_source = ean.as_ref().map(|_| "listing".to_string());
-        let available_qty = extract_tottus_listing_stock(item, selling_price);
+        let availability = extract_tottus_listing_availability(item);
 
         products.push(Product {
             retailer: "tottus".to_string(),
@@ -768,8 +754,8 @@ fn parse_results_from_root(
                 sku_id,
                 ean,
                 ean_source,
-                availability_status: "unknown".to_string(),
-                availability_source: "none".to_string(),
+                availability_status: availability.status.to_string(),
+                availability_source: availability.source.to_string(),
                 seller_id,
                 seller_name: None,
                 seller_count: None,
@@ -782,7 +768,7 @@ fn parse_results_from_root(
                 selling_price,
                 card_price,
                 card_program,
-                available_qty,
+                available_qty: availability.qty,
             }],
         });
     }
@@ -910,8 +896,18 @@ impl RetailerAdapter for FalabellaListingAdapter {
                                     sku.ean_source = Some("pdp".to_string());
                                 }
                             }
-                            if let Some(qty) = enrichment.available_qty {
-                                sku.available_qty = Some(qty);
+                            if let Some(in_stock) = enrichment.in_stock {
+                                sku.available_qty = if !in_stock {
+                                    Some(0)
+                                } else {
+                                    enrichment.available_qty
+                                };
+                                sku.availability_status = if in_stock {
+                                    "in_stock".to_string()
+                                } else {
+                                    "out_of_stock".to_string()
+                                };
+                                sku.availability_source = "tottus_pdp".to_string();
                             }
                         }
                     }
@@ -1202,35 +1198,90 @@ mod tests {
 
         assert_eq!(products[0].skus[0].card_price, Some(3.90));
         assert_eq!(products[0].skus[0].card_program.as_deref(), Some("CMR"));
-        assert_eq!(products[0].skus[0].available_qty, Some(1));
+        assert_eq!(products[0].skus[0].available_qty, None);
+        assert_eq!(products[0].skus[0].availability_status, "listed_unknown");
+        assert_eq!(
+            products[0].skus[0].availability_source,
+            "tottus_listing_presence"
+        );
 
         assert_eq!(products[1].skus[0].card_price, None);
         assert_eq!(products[1].skus[0].card_program, None);
         assert_eq!(products[1].skus[0].available_qty, Some(0));
+        assert_eq!(products[1].skus[0].availability_status, "out_of_stock");
+        assert_eq!(
+            products[1].skus[0].availability_source,
+            "tottus_listing_flag"
+        );
 
         assert_eq!(products[2].skus[0].available_qty, Some(18));
+        assert_eq!(products[2].skus[0].availability_status, "in_stock");
+        assert_eq!(
+            products[2].skus[0].availability_source,
+            "tottus_listing_qty"
+        );
         assert_eq!(products[3].skus[0].available_qty, Some(0));
+        assert_eq!(products[3].skus[0].availability_status, "out_of_stock");
+        assert_eq!(
+            products[3].skus[0].availability_source,
+            "tottus_listing_flag"
+        );
 
         let no_signal = serde_json::json!({"productId": "105", "prices": []});
-        assert_eq!(extract_tottus_listing_stock(&no_signal, None), None);
+        assert_eq!(
+            extract_tottus_listing_availability(&no_signal),
+            AvailabilityObs {
+                qty: None,
+                status: "listed_unknown",
+                source: "tottus_listing_presence",
+            }
+        );
         let null_offer =
             serde_json::json!({"productId": "106", "offeringId": null, "availability": null});
-        assert_eq!(extract_tottus_listing_stock(&null_offer, Some(4.5)), None);
+        assert_eq!(
+            extract_tottus_listing_availability(&null_offer),
+            AvailabilityObs {
+                qty: None,
+                status: "listed_unknown",
+                source: "tottus_listing_presence",
+            }
+        );
         let with_avail =
             serde_json::json!({"productId": "107", "availability": {"homeDelivery": "AVAILABLE"}});
         assert_eq!(
-            extract_tottus_listing_stock(&with_avail, Some(4.5)),
-            Some(1)
+            extract_tottus_listing_availability(&with_avail),
+            AvailabilityObs {
+                qty: None,
+                status: "listed_unknown",
+                source: "tottus_listing_presence",
+            }
         );
         let with_stock_field = serde_json::json!({"productId": "108", "stock": 7});
         assert_eq!(
-            extract_tottus_listing_stock(&with_stock_field, Some(4.5)),
-            Some(7)
+            extract_tottus_listing_availability(&with_stock_field),
+            AvailabilityObs {
+                qty: Some(7),
+                status: "in_stock",
+                source: "tottus_listing_qty",
+            }
+        );
+        let with_zero_stock = serde_json::json!({"productId": "108b", "stock": 0});
+        assert_eq!(
+            extract_tottus_listing_availability(&with_zero_stock),
+            AvailabilityObs {
+                qty: Some(0),
+                status: "out_of_stock",
+                source: "tottus_listing_qty",
+            }
         );
         let with_max_cart = serde_json::json!({"productId": "109", "maxOnCartAmount": 12});
         assert_eq!(
-            extract_tottus_listing_stock(&with_max_cart, Some(4.5)),
-            Some(12)
+            extract_tottus_listing_availability(&with_max_cart),
+            AvailabilityObs {
+                qty: None,
+                status: "listed_unknown",
+                source: "tottus_listing_presence",
+            }
         );
     }
 
@@ -1341,7 +1392,7 @@ mod tests {
             parsed,
             TottusPdpEnrichment {
                 ean: Some("7751271034142".to_string()),
-                available_qty: Some(24),
+                available_qty: None,
                 in_stock: Some(true),
                 seller_sku_id: Some("SELL-940".to_string()),
             }
@@ -1413,9 +1464,10 @@ mod tests {
             "variants": [{"id": "777"}]
           }}}
         }</script></body></html>"#;
-        let parsed_default_one = parse_tottus_pdp_html(html_instock_zero_units_no_limit, "777");
-        assert_eq!(parsed_default_one.in_stock, Some(true));
-        assert_eq!(parsed_default_one.available_qty, Some(1));
+        let parsed_no_fabricated_qty =
+            parse_tottus_pdp_html(html_instock_zero_units_no_limit, "777");
+        assert_eq!(parsed_no_fabricated_qty.in_stock, Some(true));
+        assert_eq!(parsed_no_fabricated_qty.available_qty, None);
     }
 
     #[test]
@@ -1451,7 +1503,7 @@ mod tests {
         let parsed = parse_tottus_pdp_html(html, "113705686");
         assert_eq!(parsed.ean, None);
         assert_eq!(parsed.in_stock, Some(true));
-        assert_eq!(parsed.available_qty, Some(24));
+        assert_eq!(parsed.available_qty, None);
         assert_eq!(parsed.seller_sku_id.as_deref(), Some("20456789"));
     }
 
@@ -1700,11 +1752,21 @@ mod tests {
 
         assert_eq!(batch1.products[0].skus[0].ean, None);
         assert_eq!(batch1.products[0].skus[0].ean_source, None);
-        assert_eq!(batch1.products[0].skus[0].available_qty, Some(1));
+        assert_eq!(batch1.products[0].skus[0].available_qty, None);
+        assert_eq!(
+            batch1.products[0].skus[0].availability_status,
+            "listed_unknown"
+        );
+        assert_eq!(
+            batch1.products[0].skus[0].availability_source,
+            "tottus_listing_presence"
+        );
 
         assert_eq!(batch1.products[1].skus[0].ean, None);
         assert_eq!(batch1.products[1].skus[0].ean_source, None);
-        assert_eq!(batch1.products[1].skus[0].available_qty, Some(24));
+        assert_eq!(batch1.products[1].skus[0].available_qty, None);
+        assert_eq!(batch1.products[1].skus[0].availability_status, "in_stock");
+        assert_eq!(batch1.products[1].skus[0].availability_source, "tottus_pdp");
         assert_eq!(
             batch1.products[1].skus[0].card_program.as_deref(),
             Some("CMR")
@@ -1719,21 +1781,27 @@ mod tests {
             Some("pdp")
         );
         assert_eq!(batch1.products[2].skus[0].available_qty, Some(0));
+        assert_eq!(
+            batch1.products[2].skus[0].availability_status,
+            "out_of_stock"
+        );
+        assert_eq!(batch1.products[2].skus[0].availability_source, "tottus_pdp");
 
         // Verify persisted cache contents: seeded 1001 was overwritten as pdp_checked with ean: None.
         let saved_cache = TottusPdpCache::load(&cache_path).unwrap();
         assert!(saved_cache
             .get("1001")
             .is_some_and(|e| e.pdp_checked && e.source == "tottus_pdp_ssr" && e.ean.is_none()));
-        assert!(saved_cache
-            .get("1002")
-            .is_some_and(|e| e.pdp_checked && e.ean.is_none() && e.available_qty == Some(24)));
+        assert!(saved_cache.get("1002").is_some_and(|e| e.pdp_checked
+            && e.ean.is_none()
+            && e.in_stock == Some(true)
+            && e.available_qty.is_none()));
         assert!(saved_cache.get("1003").is_some_and(|e| e.pdp_checked
             && e.source == "tottus_pdp_ssr"
             && e.ean.as_deref() == Some("7751271034142")
             && e.available_qty == Some(0)));
 
-        // Second fetch: ZERO PDP requests, only 1 listing request!
+        // Second fetch: ZERO PDP requests, only 1 listing request; cached availability does NOT override listing!
         let batch2 = adapter.fetch_page("leche", 0, 20, &ctx).await.unwrap();
         assert_eq!(batch2.raw_bytes, expected_listing_bytes);
         assert_eq!(search_hits.load(Ordering::SeqCst), 2);
@@ -1743,7 +1811,15 @@ mod tests {
 
         assert_eq!(batch2.products[0].skus[0].ean, None);
         assert_eq!(batch2.products[0].skus[0].ean_source, None);
-        assert_eq!(batch2.products[1].skus[0].available_qty, Some(24));
+        assert_eq!(batch2.products[1].skus[0].available_qty, None);
+        assert_eq!(
+            batch2.products[1].skus[0].availability_status,
+            "listed_unknown"
+        );
+        assert_eq!(
+            batch2.products[1].skus[0].availability_source,
+            "tottus_listing_presence"
+        );
         assert_eq!(
             batch2.products[2].skus[0].ean.as_deref(),
             Some("7751271034142")
@@ -1752,9 +1828,17 @@ mod tests {
             batch2.products[2].skus[0].ean_source.as_deref(),
             Some("pdp")
         );
-        assert_eq!(batch2.products[2].skus[0].available_qty, Some(0));
+        assert_eq!(batch2.products[2].skus[0].available_qty, None);
+        assert_eq!(
+            batch2.products[2].skus[0].availability_status,
+            "listed_unknown"
+        );
+        assert_eq!(
+            batch2.products[2].skus[0].availability_source,
+            "tottus_listing_presence"
+        );
 
-        // Cache-only mode (enrich_pdp = false) still enriches from verified PDP cache with zero PDP hits.
+        // Cache-only mode (enrich_pdp = false) enriches EAN from verified PDP cache with zero PDP hits, without inheriting cached availability.
         let cache_only_adapter = FalabellaListingAdapter::with_enrichment(
             format!("http://{addr}"),
             test_http(),
@@ -1772,7 +1856,11 @@ mod tests {
         assert_eq!(pdp_1003_hits.load(Ordering::SeqCst), 1);
         assert_eq!(batch3.products[0].skus[0].ean, None);
         assert_eq!(batch3.products[0].skus[0].ean_source, None);
-        assert_eq!(batch3.products[1].skus[0].available_qty, Some(24));
+        assert_eq!(batch3.products[1].skus[0].available_qty, None);
+        assert_eq!(
+            batch3.products[1].skus[0].availability_status,
+            "listed_unknown"
+        );
         assert_eq!(
             batch3.products[2].skus[0].ean.as_deref(),
             Some("7751271034142")
@@ -1781,7 +1869,11 @@ mod tests {
             batch3.products[2].skus[0].ean_source.as_deref(),
             Some("pdp")
         );
-        assert_eq!(batch3.products[2].skus[0].available_qty, Some(0));
+        assert_eq!(batch3.products[2].skus[0].available_qty, None);
+        assert_eq!(
+            batch3.products[2].skus[0].availability_status,
+            "listed_unknown"
+        );
     }
 
     #[tokio::test]
@@ -1868,11 +1960,22 @@ mod tests {
 
         assert_eq!(batch.products.len(), 2);
         assert_eq!(batch.products[0].skus[0].ean, None);
-        assert_eq!(batch.products[0].skus[0].available_qty, Some(1));
+        assert_eq!(batch.products[0].skus[0].available_qty, None);
+        assert_eq!(
+            batch.products[0].skus[0].availability_status,
+            "listed_unknown"
+        );
+        assert_eq!(
+            batch.products[0].skus[0].availability_source,
+            "tottus_listing_presence"
+        );
         assert_eq!(
             batch.products[1].skus[0].ean.as_deref(),
             Some("7751271034142")
         );
+        assert_eq!(batch.products[1].skus[0].availability_status, "in_stock");
+        assert_eq!(batch.products[1].skus[0].availability_source, "tottus_pdp");
+        assert_eq!(batch.products[1].skus[0].available_qty, None);
 
         let saved_cache = TottusPdpCache::load(&cache_path).unwrap();
         assert!(saved_cache.get("2001").is_none());
@@ -1891,8 +1994,8 @@ mod tests {
         assert_eq!(pa.len(), 1);
         assert_eq!(pa[0].query_term, "leche");
         assert_eq!(pa[0].content_hash, pb[0].content_hash);
-        assert_eq!(pa[0].skus[0].availability_status, "unknown");
-        assert_eq!(pa[0].skus[0].availability_source, "none");
+        assert_eq!(pa[0].skus[0].availability_status, "listed_unknown");
+        assert_eq!(pa[0].skus[0].availability_source, "tottus_listing_presence");
         assert_eq!(pa[0].skus[0].ean_source, None);
     }
 
@@ -2070,5 +2173,194 @@ mod tests {
         );
         assert_eq!(cache.get("S1").unwrap().source, "tottus_pdp_ssr");
         assert!(cache.get("S1").unwrap().pdp_checked);
+    }
+
+    #[test]
+    fn tottus_listing_without_stock_fields_is_listed_unknown_not_qty_1() {
+        let item =
+            serde_json::json!({"offeringId": "x", "availability": {"homeDeliveryShipping": ""}});
+        assert_eq!(
+            extract_tottus_listing_availability(&item),
+            crate::domain::AvailabilityObs {
+                qty: None,
+                status: "listed_unknown",
+                source: "tottus_listing_presence",
+            }
+        );
+    }
+
+    #[test]
+    fn tottus_max_on_cart_amount_is_not_stock() {
+        assert_eq!(
+            extract_tottus_listing_availability(&serde_json::json!({"maxOnCartAmount": 24})).qty,
+            None
+        );
+    }
+
+    #[test]
+    fn tottus_listing_out_of_stock_flag_wins() {
+        let item = serde_json::json!({
+            "availability": {"isOutOfStock": true},
+            "availableQuantity": 5
+        });
+        assert_eq!(
+            extract_tottus_listing_availability(&item),
+            crate::domain::AvailabilityObs {
+                qty: Some(0),
+                status: "out_of_stock",
+                source: "tottus_listing_flag",
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn tottus_cached_availability_never_overrides_listing() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let cache_path = dir.path().join("tottus_ean_cache.json");
+
+        let mut cache_map = std::collections::BTreeMap::new();
+        cache_map.insert(
+            "S100".to_string(),
+            TottusCacheEntry {
+                ean: Some("7751271031103".to_string()),
+                available_qty: Some(0),
+                in_stock: Some(false),
+                seller_sku_id: None,
+                source: TOTTUS_CACHE_SOURCE_PDP.to_string(),
+                pdp_checked: true,
+                updated_at: chrono::Utc::now(),
+            },
+        );
+        std::fs::write(&cache_path, serde_json::to_vec_pretty(&cache_map).unwrap()).unwrap();
+
+        let listing_body = r#"{"props":{"pageProps":{"results":[
+          {
+            "productId": "P100",
+            "skuId": "S100",
+            "displayName": "Leche Sin Stock En Listado",
+            "url": "/tottus-pe/product/P100/leche/S100",
+            "offeringId": "off-100",
+            "prices": [{"type": "internetPrice", "price": ["5.90"]}]
+          }
+        ]}}}"#
+            .to_string();
+        let addr = spawn_listing_server(listing_body).await;
+        let adapter = FalabellaListingAdapter::with_enrichment(
+            format!("http://{addr}"),
+            test_http(),
+            false,
+            Some(cache_path),
+        );
+        let ctx = FetchContext::for_run(Uuid::new_v4(), "PE", None);
+        let batch = adapter.fetch_page("leche", 0, 20, &ctx).await.unwrap();
+        let sku = &batch.products[0].skus[0];
+        assert_eq!(sku.ean.as_deref(), Some("7751271031103"));
+        assert_eq!(sku.ean_source.as_deref(), Some("pdp"));
+        assert_eq!(sku.available_qty, None);
+        assert_eq!(sku.availability_status, "listed_unknown");
+        assert_eq!(sku.availability_source, "tottus_listing_presence");
+    }
+
+    #[tokio::test]
+    async fn tottus_pdp_fetched_this_run_sets_pdp_source() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let cache_path = dir.path().join("tottus_ean_cache.json");
+
+        let listing_body = r#"{"props":{"pageProps":{"results":[
+          {
+            "productId": "P-OOS",
+            "skuId": "S-OOS",
+            "displayName": "Leche Agotada PDP",
+            "url": "/tottus-pe/product/P-OOS/leche-oos/S-OOS",
+            "offeringId": "off-oos",
+            "prices": [{"type": "internetPrice", "price": ["5.90"]}]
+          },
+          {
+            "productId": "P-IN",
+            "skuId": "S-IN",
+            "displayName": "Leche En Stock PDP",
+            "url": "/tottus-pe/product/P-IN/leche-in/S-IN",
+            "offeringId": "off-in",
+            "prices": [{"type": "internetPrice", "price": ["6.50"]}]
+          }
+        ]}}}"#
+            .to_string();
+
+        let pdp_oos = r#"<html><head>
+        <script type="application/ld+json">{
+          "@type": "Product",
+          "offers": {"@type": "Offer", "availability": "https://schema.org/OutOfStock"}
+        }</script></head></html>"#
+            .to_string();
+
+        let pdp_in = r#"<html><head>
+        <script type="application/ld+json">{
+          "@type": "Product",
+          "offers": {"@type": "Offer", "availability": "https://schema.org/InStock"}
+        }</script></head><body>
+        <script id="__NEXT_DATA__" type="application/json">{
+          "props": {"pageProps": {"productData": {
+            "isOutOfStock": false,
+            "stockUnits": {"S-IN": 7},
+            "variants": [{"id": "S-IN"}]
+          }}}
+        }</script></body></html>"#
+            .to_string();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let listing_body = listing_body.clone();
+                let pdp_oos = pdp_oos.clone();
+                let pdp_in = pdp_in.clone();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let n = socket.read(&mut buf).await.unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]);
+                    let path = req
+                        .lines()
+                        .next()
+                        .and_then(|line| line.split_whitespace().nth(1))
+                        .unwrap_or("/");
+                    let (status, reason, body) = if path.starts_with("/tottus-pe/search") {
+                        (200, "OK", listing_body)
+                    } else if path.contains("/S-OOS") {
+                        (200, "OK", pdp_oos)
+                    } else if path.contains("/S-IN") {
+                        (200, "OK", pdp_in)
+                    } else {
+                        (404, "Not Found", "missing".to_string())
+                    };
+                    let resp = format!(
+                        "HTTP/1.1 {status} {reason}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = socket.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+
+        let adapter = FalabellaListingAdapter::with_enrichment(
+            format!("http://{addr}"),
+            test_http(),
+            true,
+            Some(cache_path),
+        );
+        let ctx = FetchContext::for_run(Uuid::new_v4(), "PE", None);
+        let batch = adapter.fetch_page("leche", 0, 20, &ctx).await.unwrap();
+
+        let oos_sku = &batch.products[0].skus[0];
+        assert_eq!(oos_sku.availability_status, "out_of_stock");
+        assert_eq!(oos_sku.availability_source, "tottus_pdp");
+        assert_eq!(oos_sku.available_qty, Some(0));
+
+        let in_sku = &batch.products[1].skus[0];
+        assert_eq!(in_sku.availability_status, "in_stock");
+        assert_eq!(in_sku.availability_source, "tottus_pdp");
+        assert_eq!(in_sku.available_qty, Some(7));
     }
 }

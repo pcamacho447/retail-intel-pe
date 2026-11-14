@@ -7,7 +7,7 @@ use serde_json::Value;
 use crate::adapter::{FetchContext, PageBatch, RetailerAdapter};
 use crate::adapters::{absolutize_url, encode_url_segment, value_as_string};
 use crate::dedup::{compute_content_hash, compute_payload_hash};
-use crate::domain::{normalize_opt_string, validate_gtin_mod10, Product, SkuItem};
+use crate::domain::{normalize_opt_string, validate_gtin_mod10, AvailabilityObs, Product, SkuItem};
 use crate::http::RateLimitedHttpClient;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -340,6 +340,33 @@ fn extract_card_offer(
     }
 }
 
+fn vtex_availability(offer: &Value) -> AvailabilityObs {
+    let qty = offer
+        .get("AvailableQuantity")
+        .and_then(|v| v.as_i64().or_else(|| v.as_f64().map(|f| f as i64)));
+
+    if let Some(is_avail) = offer.get("IsAvailable").and_then(|v| v.as_bool()) {
+        return AvailabilityObs {
+            qty,
+            status: if is_avail { "in_stock" } else { "out_of_stock" },
+            source: "vtex_offer",
+        };
+    }
+
+    match qty {
+        Some(q) => AvailabilityObs {
+            qty: Some(q),
+            status: if q > 0 { "in_stock" } else { "out_of_stock" },
+            source: "vtex_offer",
+        },
+        None => AvailabilityObs {
+            qty: None,
+            status: "unknown",
+            source: "none",
+        },
+    }
+}
+
 fn parse_vtex_sku(
     item: &Value,
     product_elem: &Value,
@@ -370,7 +397,7 @@ fn parse_vtex_sku(
             .or_else(|| arr.first())
     });
 
-    let (seller_id, list_price, selling_price, card_price, card_program, available_qty) =
+    let (seller_id, list_price, selling_price, card_price, card_program, availability) =
         if let Some(seller) = selected_seller {
             let seller_id = value_as_string(seller.get("sellerId"));
             let offer = seller.get("commertialOffer").unwrap_or(&Value::Null);
@@ -378,27 +405,36 @@ fn parse_vtex_sku(
             let selling_price = positive_f64(offer.get("Price"));
             let (card_price, card_program) =
                 extract_card_offer(offer, &sku_id, list_price, selling_price, retailer);
-            let available_qty = offer
-                .get("AvailableQuantity")
-                .and_then(|v| v.as_i64().or_else(|| v.as_f64().map(|f| f as i64)));
+            let availability = vtex_availability(offer);
             (
                 seller_id,
                 list_price,
                 selling_price,
                 card_price,
                 card_program,
-                available_qty,
+                availability,
             )
         } else {
-            (None, None, None, None, None, None)
+            (
+                None,
+                None,
+                None,
+                None,
+                None,
+                AvailabilityObs {
+                    qty: None,
+                    status: "unknown",
+                    source: "none",
+                },
+            )
         };
 
     Some(SkuItem {
         sku_id,
         ean,
         ean_source,
-        availability_status: "unknown".to_string(),
-        availability_source: "none".to_string(),
+        availability_status: availability.status.to_string(),
+        availability_source: availability.source.to_string(),
         seller_id,
         seller_name: None,
         seller_count: None,
@@ -411,7 +447,7 @@ fn parse_vtex_sku(
         selling_price,
         card_price,
         card_program,
-        available_qty,
+        available_qty: availability.qty,
     })
 }
 
@@ -726,6 +762,8 @@ mod tests {
         assert_eq!(p1.skus[0].card_price, Some(3.78));
         assert_eq!(p1.skus[0].card_program.as_deref(), Some("Oh!"));
         assert_eq!(p1.skus[0].available_qty, Some(35));
+        assert_eq!(p1.skus[0].availability_status, "in_stock");
+        assert_eq!(p1.skus[0].availability_source, "vtex_offer");
 
         assert_eq!(p1.skus[1].sku_id, "1002");
         assert_eq!(p1.skus[1].ean, None);
@@ -741,6 +779,8 @@ mod tests {
         assert_eq!(p2.skus[0].selling_price, None);
         assert_eq!(p2.skus[0].card_program, None);
         assert_eq!(p2.skus[0].available_qty, None);
+        assert_eq!(p2.skus[0].availability_status, "unknown");
+        assert_eq!(p2.skus[0].availability_source, "none");
     }
 
     #[test]
@@ -1572,5 +1612,95 @@ mod tests {
         assert_eq!(products[4].skus[0].ean_source, None);
         assert_eq!(products[4].skus[1].ean, None);
         assert_eq!(products[4].skus[1].ean_source, None);
+    }
+
+    #[test]
+    fn vtex_is_available_false_wins_over_sentinel_quantity() {
+        let offer = serde_json::json!({"IsAvailable": false, "AvailableQuantity": 99999});
+        assert_eq!(
+            vtex_availability(&offer),
+            crate::domain::AvailabilityObs {
+                qty: Some(99999),
+                status: "out_of_stock",
+                source: "vtex_offer",
+            }
+        );
+    }
+
+    #[test]
+    fn vtex_availability_falls_back_to_quantity_then_unknown() {
+        assert_eq!(
+            vtex_availability(&serde_json::json!({"IsAvailable": true, "AvailableQuantity": 0})),
+            crate::domain::AvailabilityObs {
+                qty: Some(0),
+                status: "in_stock",
+                source: "vtex_offer",
+            }
+        );
+        assert_eq!(
+            vtex_availability(&serde_json::json!({"AvailableQuantity": 0})).status,
+            "out_of_stock"
+        );
+        assert_eq!(
+            vtex_availability(&serde_json::json!({"AvailableQuantity": 5})).status,
+            "in_stock"
+        );
+        assert_eq!(
+            vtex_availability(&serde_json::json!({})),
+            crate::domain::AvailabilityObs {
+                qty: None,
+                status: "unknown",
+                source: "none",
+            }
+        );
+    }
+
+    #[test]
+    fn vtex_parse_page_payload_propagates_availability_status_and_source() {
+        let fixture = r#"[
+          {
+            "productId": "8001",
+            "productName": "Sentinel OOS",
+            "items": [{
+              "itemId": "80011",
+              "name": "Sentinel OOS",
+              "sellers": [{
+                "sellerId": "1",
+                "commertialOffer": {
+                  "Price": 10.0,
+                  "IsAvailable": false,
+                  "AvailableQuantity": 99999
+                }
+              }]
+            }]
+          },
+          {
+            "productId": "8002",
+            "productName": "Flag Only InStock",
+            "items": [{
+              "itemId": "80021",
+              "name": "Flag Only InStock",
+              "sellers": [{
+                "sellerId": "1",
+                "commertialOffer": {
+                  "Price": 12.0,
+                  "IsAvailable": true
+                }
+              }]
+            }]
+          }
+        ]"#;
+
+        let adapter = VtexAdapter::new(VtexRetailer::PlazaVea, test_http());
+        let ctx = FetchContext::for_run(Uuid::new_v4(), "PE", None);
+        let products = adapter.parse_page_payload(fixture, &ctx).unwrap();
+
+        assert_eq!(products[0].skus[0].available_qty, Some(99999));
+        assert_eq!(products[0].skus[0].availability_status, "out_of_stock");
+        assert_eq!(products[0].skus[0].availability_source, "vtex_offer");
+
+        assert_eq!(products[1].skus[0].available_qty, None);
+        assert_eq!(products[1].skus[0].availability_status, "in_stock");
+        assert_eq!(products[1].skus[0].availability_source, "vtex_offer");
     }
 }

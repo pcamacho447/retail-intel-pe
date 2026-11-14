@@ -4,6 +4,13 @@ use uuid::Uuid;
 
 pub const BRONZE_CONTRACT_VERSION: &str = "2.0.0";
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AvailabilityObs {
+    pub qty: Option<i64>,
+    pub status: &'static str,
+    pub source: &'static str,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SkuItem {
     pub sku_id: String,

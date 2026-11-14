@@ -98,6 +98,21 @@ Invariantes:
 - `tottus_pdp`: derivado de la PDP Tottus consultada en la corrida actual.
 - `none`: sin señal de disponibilidad observada. Únicamente válido cuando `availability_status = "unknown"`.
 
+#### Reglas de extracción (`AvailabilityObs`)
+
+| Caso | qty | status | source |
+| --- | --- | --- | --- |
+| VTEX `IsAvailable: true` | `AvailableQuantity` crudo | `in_stock` | `vtex_offer` |
+| VTEX `IsAvailable: false` | `AvailableQuantity` crudo | `out_of_stock` | `vtex_offer` |
+| VTEX sin `IsAvailable`, qty > 0 / qty = 0 | crudo | `in_stock` / `out_of_stock` | `vtex_offer` |
+| VTEX sin ninguno de los dos | `None` | `unknown` | `none` |
+| Tottus `isOutOfStock: true` (raíz o `availability`) | `Some(0)` | `out_of_stock` | `tottus_listing_flag` |
+| Tottus `availableQuantity` o `stock` numérico | ese valor | `in_stock` si > 0, si no `out_of_stock` | `tottus_listing_qty` |
+| Tottus listado sin esas señales | `None` | `listed_unknown` | `tottus_listing_presence` |
+| Tottus PDP consultada en esta corrida con `in_stock` conocido | qty de la PDP (`Some(0)` si agotado) | `in_stock` / `out_of_stock` | `tottus_pdp` |
+
+`maxOnCartAmount` no es stock y no se lee. La caché nunca aporta disponibilidad a una fila.
+
 ### `content_hash` y claves volátiles
 
 `content_hash` se calcula eliminando recursivamente las claves volátiles declaradas por cada adaptador (`RetailerAdapter::volatile_payload_keys()`), serializando el JSON con orden determinista de claves y aplicando SHA-256 en hexadecimal minúscula (si el payload no es JSON válido, coincide con `payload_hash`):
