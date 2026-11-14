@@ -809,7 +809,12 @@ impl RetailerAdapter for FalabellaListingAdapter {
     }
 
     fn extractor_version(&self) -> &'static str {
-        "falabella-listing-v1.0.0"
+        concat!(
+            "falabella-listing-v",
+            env!("CARGO_PKG_VERSION"),
+            "+",
+            env!("INGESTOR_GIT_SHA")
+        )
     }
 
     fn build_page_url(&self, category_or_query: &str, offset: usize, page_size: usize) -> String {
@@ -1852,5 +1857,18 @@ mod tests {
         assert_eq!(pa[0].skus[0].availability_status, "unknown");
         assert_eq!(pa[0].skus[0].availability_source, "none");
         assert_eq!(pa[0].skus[0].ean_source, None);
+    }
+
+    #[test]
+    fn extractor_version_embeds_crate_version_and_git_state() {
+        let adapter = FalabellaListingAdapter::new_tottus(test_http());
+        let v = adapter.extractor_version();
+        assert_eq!(env!("CARGO_PKG_VERSION"), "1.1.0");
+        assert!(v.starts_with("falabella-listing-v1.1.0+"));
+        let sha = v.rsplit('+').next().unwrap();
+        let base = sha.strip_suffix("-dirty").unwrap_or(sha);
+        assert!(
+            base == "nogit" || (base.len() == 7 && base.chars().all(|c| c.is_ascii_hexdigit()))
+        );
     }
 }

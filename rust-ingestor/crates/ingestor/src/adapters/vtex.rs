@@ -411,7 +411,12 @@ impl RetailerAdapter for VtexAdapter {
     }
 
     fn extractor_version(&self) -> &'static str {
-        "vtex-catalog-v1.0.0"
+        concat!(
+            "vtex-catalog-v",
+            env!("CARGO_PKG_VERSION"),
+            "+",
+            env!("INGESTOR_GIT_SHA")
+        )
     }
 
     fn volatile_payload_keys(&self) -> &'static [&'static str] {
@@ -1447,5 +1452,18 @@ mod tests {
         assert_eq!(pb[0].query_term, "lacteos");
         assert_eq!(pa[0].content_hash, pb[0].content_hash);
         assert_ne!(pa[0].payload_hash, pb[0].payload_hash);
+    }
+
+    #[test]
+    fn extractor_version_embeds_crate_version_and_git_state() {
+        let adapter = VtexAdapter::new(VtexRetailer::Metro, test_http());
+        let v = adapter.extractor_version();
+        assert_eq!(env!("CARGO_PKG_VERSION"), "1.1.0");
+        assert!(v.starts_with("vtex-catalog-v1.1.0+"));
+        let sha = v.rsplit('+').next().unwrap();
+        let base = sha.strip_suffix("-dirty").unwrap_or(sha);
+        assert!(
+            base == "nogit" || (base.len() == 7 && base.chars().all(|c| c.is_ascii_hexdigit()))
+        );
     }
 }
