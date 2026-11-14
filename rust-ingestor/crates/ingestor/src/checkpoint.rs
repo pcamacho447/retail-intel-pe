@@ -1,0 +1,146 @@
+use std::fs;
+use std::path::{Path, PathBuf};
+
+use anyhow::Context;
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use uuid::Uuid;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CheckpointState {
+    pub retailer: String,
+    pub category: String,
+    pub next_offset: usize,
+    pub pages_completed: usize,
+    pub extraction_run_id: Uuid,
+    pub updated_at: DateTime<Utc>,
+    pub completed: bool,
+}
+
+pub struct CheckpointStore {
+    checkpoints_dir: PathBuf,
+}
+
+/// Sanitizes a category/query slug so it is safe to use inside a checkpoint filename.
+pub fn sanitize_category(category: &str) -> String {
+    let mut out = String::with_capacity(category.len());
+    let mut prev_underscore = true;
+
+    for ch in category.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch);
+            prev_underscore = false;
+        } else if !prev_underscore {
+            out.push('_');
+            prev_underscore = true;
+        }
+    }
+
+    while out.ends_with('_') {
+        out.pop();
+    }
+
+    if out.is_empty() {
+        "default".to_string()
+    } else {
+        out
+    }
+}
+
+impl CheckpointStore {
+    pub fn new(bronze_dir: impl AsRef<Path>) -> Self {
+        Self {
+            checkpoints_dir: bronze_dir.as_ref().join("checkpoints"),
+        }
+    }
+
+    pub fn path_for(&self, retailer: &str, category: &str) -> PathBuf {
+        let filename = format!(
+            "{}_{}.json",
+            sanitize_category(retailer),
+            sanitize_category(category)
+        );
+        self.checkpoints_dir.join(filename)
+    }
+
+    pub fn load(&self, retailer: &str, category: &str) -> anyhow::Result<Option<CheckpointState>> {
+        let path = self.path_for(retailer, category);
+        if !path.exists() {
+            return Ok(None);
+        }
+        let bytes = fs::read(&path)
+            .with_context(|| format!("failed to read checkpoint {}", path.display()))?;
+        let state: CheckpointState = serde_json::from_slice(&bytes)
+            .with_context(|| format!("failed to parse checkpoint {}", path.display()))?;
+        Ok(Some(state))
+    }
+
+    pub fn save(&self, state: &CheckpointState) -> anyhow::Result<()> {
+        let path = self.path_for(&state.retailer, &state.category);
+        let bytes = serde_json::to_vec_pretty(state)?;
+        crate::atomic_write(&path, &bytes)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn sanitize_category_replaces_unsafe_characters() {
+        assert_eq!(sanitize_category("lacteos"), "lacteos");
+        assert_eq!(
+            sanitize_category("/tottus-pe/Lácteos & Bebidas?cat=1"),
+            "tottus_pe_L_cteos_Bebidas_cat_1"
+        );
+    }
+
+    #[test]
+    fn checkpoint_store_returns_none_when_absent() {
+        let dir = TempDir::new().unwrap();
+        let store = CheckpointStore::new(dir.path());
+        let loaded = store.load("plazavea", "lacteos").unwrap();
+        assert_eq!(loaded, None);
+    }
+
+    #[test]
+    fn checkpoint_store_saves_and_reloads_state_across_updates() {
+        let dir = TempDir::new().unwrap();
+        let store = CheckpointStore::new(dir.path());
+        let run_id = Uuid::new_v4();
+        let now = Utc::now();
+
+        let state = CheckpointState {
+            retailer: "tottus".to_string(),
+            category: "leche/evaporada".to_string(),
+            next_offset: 40,
+            pages_completed: 2,
+            extraction_run_id: run_id,
+            updated_at: now,
+            completed: false,
+        };
+
+        store.save(&state).unwrap();
+        let expected_path = dir
+            .path()
+            .join("checkpoints")
+            .join("tottus_leche_evaporada.json");
+        assert!(expected_path.exists());
+        assert_eq!(store.path_for("tottus", "leche/evaporada"), expected_path);
+
+        let reloaded = store.load("tottus", "leche/evaporada").unwrap().unwrap();
+        assert_eq!(reloaded, state);
+
+        let updated = CheckpointState {
+            next_offset: 60,
+            pages_completed: 3,
+            completed: true,
+            ..state
+        };
+        store.save(&updated).unwrap();
+        let reloaded2 = store.load("tottus", "leche/evaporada").unwrap().unwrap();
+        assert_eq!(reloaded2, updated);
+        assert!(reloaded2.completed);
+    }
+}

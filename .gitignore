@@ -1,0 +1,22 @@
+# Rust
+target/
+**/*.rs.bk
+Cargo.lock
+
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Lakehouse data & runtime state
+data/bronze/
+*.parquet
+
+# Superpowers scratch
+.superpowers/
+
+# OS / Editor
+.DS_Store
+*.swp
