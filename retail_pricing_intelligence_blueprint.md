@@ -153,7 +153,7 @@ Extracción y emparejamiento estricto de unidad/gramaje ejecutado el **13 de nov
 
 ## 6. Prompt para Antigravity CLI (`agy`)
 
-```text
+```
 Actúa como un Senior Data Engineer (Rust + Python/Polars/DuckDB + PostgreSQL) y orquestador técnico.
 Vamos a inicializar el repositorio `retail-intel-pe` en el directorio actual siguiendo estrictamente la arquitectura Medallion y los principios de diseño del proyecto Retail Pricing Intelligence (Perú: Plaza Vea, Wong, Metro, Tottus).
 
@@ -191,4 +191,137 @@ No implementes aún reglas completas de E2 ni embeddings de E3. Concéntrate en 
    - Ejecuta `cargo test` y `cargo build --release`.
    - Ejecuta una corrida piloto acotada (ej. 2 categorías de abarrotes/lácteos en Plaza Vea y Metro) contra `data/bronze/`.
    - Corre `scripts/inspect_bronze.py` sobre el Parquet generado y muéstrame las métricas reales obtenidas, la revisión de calidad del agente QA y cualquier error o bloqueo HTTP encontrado.
+
+
+```
+
+## 7. Resultados de Ejecución Fase E1 (`ca80799` en `/home/balonzifer/projects/tracker_retail_prices`)
+
+**Estado:** COMPLETADO (`APPROVED / SHIP` por `QABenchmarkAgent`)
+
+**Verificaciones:** `cargo fmt --check` (PASS), `cargo clippy -- -D warnings` (0 warnings), `cargo test` (42/42 PASS), `.venv/bin/pytest -v` (8/8 PASS), PostgreSQL 14.24 DDL idempotente (6 tablas, 24 índices).
+
+### 7.1. Telemetría Operativa y Auditoría Bronze (`dt=2026-11-14`, `--postal-code 150101`)
+
+| Retailer | Run ID | Productos | SKUs | Págs. | Req OK/Err | Latencia Prom. | MB Transf. | Duración | Pico RAM | EAN Válido (%) | En Stock (%) | Card < Selling (%) | 
+| ----- | ----- | ----- | ----- | ----- | ----- | ----- | ----- | ----- | ----- | ----- | ----- | ----- | 
+| **Plaza Vea** | `b374f6cf-...` | 73 | 73 | 4 | 4 / 0 | 227.73 ms | 0.92 MB | 1.68 s | 18.02 MB | 78.08% | 94.52% | 1.37% | 
+| **Metro** | `0279a558-...` | 80 | 81 | 4 | 4 / 0 | 385.57 ms | 2.86 MB | 1.91 s | 28.57 MB | 100.00% | 98.77% | 0.00% | 
+| **Tottus** | `23fb4813-...` | 96 | 96 | 2 | 2 / 0 | 1857.74 ms | 4.44 MB | 3.73 s | 21.07 MB | 0.00% | 0.00%\* | 1.04% | 
+| **TOTAL** | — | **249** | **250** | **10** | **10 / 0** | — | **8.22 MB** | **7.32 s** | **<= 28.57 MB** | **55.20%** | **59.60%** | **0.80%** | 
+
+*\*En Tottus (`__NEXT_DATA__` de listing), el listado entrega 48 productos/página con precios (`selling_price`, `list_price`, `card_price`), pero no expone `ean` ni stock numérico (`available_qty`), confirmando que si un ítem aparece en el listing activo está disponible para venta online o requiere enriquecimiento PDP selectivo.*
+
+### 7.2. Hallazgos Técnicos Clave de E1 para E2
+
+1. **Semántica de teasers VTEX corregida (`extract_card_price`):** En Plaza Vea (`sku=10672464`), `PromotionalPriceTableItemsDiscount` representa el *monto de descuento* sobre `ListPrice` (`5.90 - 1.00 = 4.90`), mientras que en Metro usa `MaximumUnitPriceDiscount` en centavos y `ShippingPercentualDiscount`.
+
+2. **Atomicidad de Checkpoints y Deduplicación (`IMP-01` y `IMP-02`):** `dedup.persist()` y `checkpoints.save()` se ejecutan estrictamente después de `write_bronze_parquet(...)` con `sync_all()`. Validado con corrida incremental (`10/10` duplicados con `raw_payload = NULL` y reanudación desde `offset=10`).
+
+3. **Asimetría de EAN y Stock en Tottus:** Mientras Metro (100%) y Plaza Vea (78.08%) tienen alta cobertura GTIN en listado, Tottus tiene `0%` de EAN en listing. Esto hace que **E2 (Normalización estructural con Polars)** sea crítica para emparejar Tottus contra VTEX en E3.
+
+## 8. Hardening Fase E1.5 (Cierre de Brechas en Ingesta Bronze)
+
+Al inspeccionar la muestra real de lácteos entre **Metro, Plaza Vea y Tottus**, se identificaron **5 brechas críticas en la capa Bronze** que conviene resolver en el ingestor Rust antes de construir la capa Silver (E2):
+
+1. **Tottus sin EAN ni Stock en Listing (`__NEXT_DATA__`):**
+   - *Problema:* El listing de Tottus entrega `0%` de EAN y `available_qty = NULL`, mientras que Metro (`7751271031103`, `7751271019972`) y Plaza Vea (`8445290404787`) sí exponen el GTIN-13 oficial.
+   - *Hardening en Rust (`falabella.rs`):* Auditar el árbol completo de `__NEXT_DATA__` y el endpoint de detalle/ficha de Tottus (`product/<id>` o JSON-LD `<script type="application/ld+json">` que suele incluir `"gtin13"` / `"sku"` y `"availability": "InStock"`), implementando un enriquecedor con caché local SQLite/JSON (`sku_id -> ean`) para consultar el EAN de cada SKU nuevo **una sola vez** y reutilizarlo en corridas posteriores sin penalizar latencia.
+2. **Falta de Wong en la corrida Bronze (`4/4` retailers):**
+   - *Problema:* La corrida piloto de E1 cubrió Plaza Vea, Metro y Tottus, pero falta validar empíricamente a **Wong** (`wong.pe`) en `data/bronze/dt=2026-11-14/` y comprobar cómo expone sus teasers de **Tarjeta Cencosud** y **Wong Prime**.
+3. **Pérdida del medio de pago / programa en `card_price`:**
+   - *Problema:* En la tabla se observa `20.50 (CMR)` en Tottus, pero en `BronzeSkuRow` solo guardar el float `card_price = 20.50` pierde la condición comercial (`CMR`, `Tarjeta Oh!`, `Tarjeta Cencosud`, `Wong Prime`, `Agora`).
+   - *Hardening en esquema Bronze:* Asegurar el campo `card_type` / `promo_condition` en `BronzeSkuRow` junto con `card_price`, e inspeccionar por qué en la muestra de Metro y Plaza Vea no se capturaron precios con Tarjeta Cencosud / Tarjeta Oh! (verificar si vienen en `Teasers`, `PromotionTeasers` o requieren cabeceras/canales específicos en VTEX).
+4. **Cobertura incompleta de EAN en Plaza Vea (78.08% vs. 100% en Metro):**
+   - *Problema:* Un 21.92% de los SKUs de Plaza Vea salieron sin `items[].ean`.
+   - *Hardening en `vtex.rs`:* Implementar cascada de fallback en el JSON de VTEX: `items[].ean` → `items[].referenceId[].Value` (cuando es un GTIN válido de 8/12/13/14 dígitos) → especificaciones del producto (`Ean` / `Código de barras`).
+5. **Resolución de las 4 observaciones Minor pendientes de `docs/qa-report-e1.md`:**
+   - Cerrar las 4 observaciones Minor documentadas en el reporte QA de E1 para dejar el módulo `rust-ingestor` 100% libre de deuda técnica antes de pasar a Python/Polars.
+
+---
+
+## 9. Prompt para Antigravity CLI (`agy`) — Fase E1.5 (Hardening Bronze & Paridad 4 Retailers)
+
+```text
+Actúa como un Senior Data Engineer (Rust + Python/DuckDB) y orquestador técnico en `/home/balonzifer/projects/tracker_retail_prices`.
+Antes de avanzar a la Fase E2 (Polars/Silver), vamos a ejecutar una sesión de **Hardening de la Fase E1 (E1.5)** para cerrar brechas reales detectadas al auditar la muestra de productos entre Metro, Plaza Vea y Tottus.
+
+METODOLOGÍA, SKILLS Y AGENTES OBLIGATORIOS:
+Apóyate explícitamente en **bmad-method**, **superpowers** y subagentes paralelos:
+1. **BMAD-METHOD (`bmad-method`):**
+   - Documenta las historias de hardening en `docs/stories/e1.5-hardening-bronze.md` y actualiza `docs/architecture-e1.md`.
+2. **Superpowers (`superpowers`):**
+   - Usa `systematic-debugging` para investigar el payload real de Tottus (búsqueda de GTIN/EAN y stock), los fallbacks de EAN en Plaza Vea y los teasers de tarjeta en VTEX (Plaza Vea, Metro, Wong).
+   - Usa `dispatching-parallel-agents` para dividir el trabajo entre:
+     * `VtexHardeningAgent`: fallback de EAN en Plaza Vea, captura de `card_price` + `card_program` (`Oh!`, `Cencosud`, `Wong Prime`) y corrida real en **Wong** (`wong.pe`).
+     * `TottusHardeningAgent`: extracción de `ean`/`gtin13` y disponibilidad (`in_stock` / `available_qty`) en Tottus (inspeccionando `__NEXT_DATA__` completo o enriquecimiento selectivo de PDP con caché local persistente `sku_id -> ean` para no repetir requests en corridas futuras).
+     * `QAHardeningAgent`: resolución de las 4 observaciones Minor pendientes en `docs/qa-report-e1.md`, tests TDD en Rust y Python, y actualización de `scripts/inspect_bronze.py`.
+   - Aplica `test-driven-development` (TDD) y `verification-before-completion` antes de cerrar.
+
+TAREAS CONCRETAS DE HARDENING (E1.5):
+1. **Enriquecimiento de EAN y Disponibilidad en Tottus (`falabella.rs`):**
+   - Inspecciona si el listado `__NEXT_DATA__` o la ficha PDP de Tottus expone el EAN/GTIN-13 (p. ej. en JSON-LD `application/ld+json`, `gtin13`, `specifications` o estado de Next.js) y el indicador de disponibilidad.
+   - Si el EAN solo vive en la PDP de Tottus, implementa un paso opcional/configurable (`--enrich-tottus-pdp` o caché local en disco `state/tottus_ean_cache.json`) que consulte la PDP respetando el rate limiter (`governor`) únicamente para SKUs cuyo EAN no esté en caché, logrando que Tottus también tenga EAN y stock verificable en Bronze.
+
+2. **Mejora de Cobertura EAN y Condición de Tarjeta en VTEX (`vtex.rs`):**
+   - En Plaza Vea el EAN válido fue 78.08%: agrega fallback a `items[].referenceId` o campos de especificación cuando `items[].ean` venga vacío, validando que sea un código numérico de 8, 12, 13 o 14 dígitos con checksum Mod-10 válido.
+   - Asegura que cuando exista `card_price`, se registre también qué tarjeta o membresía lo otorga (`CMR`, `Oh!`, `Cencosud`, `Wong Prime`) y verifica con fixtures reales por qué ciertos productos de Metro/Plaza Vea/Wong muestran o no precio de tarjeta en la API pública de búsqueda.
+
+3. **Incorporación de Wong (`wong.pe`) y Cierre de los 4 Minor de QA:**
+   - Ejecuta y valida el adaptador VTEX contra **Wong** (`lacteos,abarrotes`) para tener los **4 retailers completos** (`plazavea`, `metro`, `wong`, `tottus`) en `data/bronze/`.
+   - Corrige las 4 observaciones Minor pendientes en `docs/qa-report-e1.md`.
+
+4. **Validación Obligatoria (`verification-before-completion`):**
+   - Ejecuta `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test` y `.venv/bin/pytest -v`.
+   - Corre la ingesta piloto sobre los **4 retailers** (`plazavea`, `metro`, `wong`, `tottus`) y ejecuta `scripts/inspect_bronze.py`.
+   - Muéstrame la tabla comparativa actualizada de los 4 retailers (incluyendo la nueva cobertura de EAN en Plaza Vea y Tottus, métricas de Wong y la tabla de muestra con `P. Lista`, `P. Venta`, `P. Tarjeta + Programa` y `EAN`).
+```
+
+---
+
+## 10. Prompt para Antigravity CLI (`agy`) — Fase E2 (Normalización Silver con Polars + DuckDB)
+
+```
+Actúa como un Senior Data Engineer (Rust + Python/Polars/DuckDB + PostgreSQL) y orquestador técnico en `/home/balonzifer/projects/tracker_retail_prices`.
+Habiendo cerrado la Fase E1 (commit `ca80799`, 250 SKUs reales en `data/bronze/dt=2026-11-14/`), vamos a ejecutar la **Fase E2 (Normalización Estructural y Capa Silver)**.
+
+METODOLOGÍA, SKILLS Y AGENTES OBLIGATORIOS:
+Apóyate explícitamente en **bmad-method**, **superpowers** y los **skills y subagentes especializados**:
+1. **BMAD-METHOD (`bmad-method`):**
+   - Activa los roles **Architect**, **PM/SM**, **Dev** y **QA**.
+   - Documenta la especificación de E2 en `docs/architecture-e2.md` y las stories atómicas en `docs/stories/e2-*.md` antes de escribir código.
+2. **Superpowers (`superpowers`):**
+   - Usa `writing-plans` para trazar el plan en `docs/superpowers/plans/2026-11-14-e2-silver-normalization.md`.
+   - Usa `dispatching-parallel-agents` / `subagent-driven-development` para dividir el trabajo en paralelo:
+     * `PolarsNormalizerAgent`: motor vectorizado de normalización textual, marcas, unidades, cantidades y multipacks.
+     * `PromoAndStockAgent`: normalización de precios, clasificación de promociones/tarjetas y reglas de disponibilidad (`in_stock` para VTEX vs. presencia en listing para Tottus).
+     * `QASilverAuditAgent`: suite TDD (`pytest`), validación sobre los 250 SKUs reales de `data/bronze/dt=2026-11-14/` y reporte `docs/qa-report-e2.md`.
+   - Aplica `test-driven-development` (TDD) para todos los casos borde del parser (packs `x6`, `sixpack`, `tripack`, `twopack`, `doypack`, `3x2`, pesos escurridos, unidades `g/kg/ml/L/und/rollo/paquete`).
+   - Ejecuta `verification-before-completion` y `requesting-code-review` antes de dar por terminada la fase.
+
+ALCANCE TÉCNICO DE LA FASE E2 (SOLO CAPA SILVER — NO IMPLEMENTAR AÚN EMBEDDINGS DE E3):
+1. Catálogo de Reglas Versionadas (`config/normalization_rules_v1.yaml` o `.json`):
+   - Diccionario de marcas canónicas y alias (`GLORIA`, `PRIMOR`, `COSTEÑO`, `DULFINA`, `CARTAVIO`, `QUAKER`, `3 OSITOS`, `BELL'S`, `CUISINE & CO`, `TOTTUS`, `LAIVE`, etc.).
+   - Reglas de extracción de `net_qty`, `net_qty_unit` (`g`, `kg`, `ml`, `l`, `und`, `rollo`, `paquete`), `pack_units` (default 1), `is_multipack` (booleano) y `product_form` (`lata`, `botella`, `bolsa`, `caja`, `doypack`, `tetrapak`, `frasco`, `galonera`, `saco`).
+   - Prohibido convertir `g <-> ml` sin densidad explícita.
+   - Estandarización a unidad base:
+     * Masa (`g`, `kg`) -> `total_content_base` en `g`, `comparison_unit = "kg"`, `unit_price_std = selling_price / (total_content_base / 1000.0)`.
+     * Volumen (`ml`, `l`) -> `total_content_base` en `ml`, `comparison_unit = "L"`, `unit_price_std = selling_price / (total_content_base / 1000.0)`.
+     * Discretos (`und`, `rollo`, `paquete`) -> `total_content_base` en `und`, `comparison_unit = "und"`, `unit_price_std = selling_price / total_content_base`.
+   - Estado de normalización (`normalization_status`): `ok`, `pending_rule` (cuando no hay unidad extraíble), `mixed_pack` (packs combinados de distintos productos donde no aplica precio unitario simple) o `invalid_price`.
+
+2. Normalización Comercial, EAN y Stock:
+   - Validador determinístico de `ean_normalized`: limpieza de espacios/prefijos, verificación de longitud (EAN-8, UPC-12, EAN-13, GTIN-14) y validación matemática del dígito de control módulo 10 (si falla el checksum, `ean_normalized = NULL` y registrar flag `ean_valid = False`).
+   - Regla de stock (`in_stock` y `availability_status`): en VTEX (`plazavea`, `metro`, `wong`) usar `available_qty > 0`; en `tottus` (donde listing devuelve `available_qty = NULL` pero solo lista productos activos con `selling_price > 0`), inferir `in_stock = True` y `availability_status = "active_in_listing"`.
+   - Clasificación de promociones (`promotion_type` y `promotion_eligibility`): distinguir `none`, `open_discount` (`selling_price < list_price`), `store_card` (`card_price < selling_price` para Oh!/Cencosud/CMR) y `multipack_promo`.
+
+3. Pipeline Polars -> Silver Parquet y Auditoría DuckDB:
+   - Crea el paquete/módulo `pipeline/silver_normalize.py` (con CLI ejecutable) que lea `data/bronze/dt=YYYY-MM-DD/retailer=*/part-*.parquet`, aplique las transformaciones en Polars registrando `rule_version = "v1.0.0"` y escriba `data/silver/dt=YYYY-MM-DD/retailer=<name>/silver-<run_id>.parquet` con compresión ZSTD.
+   - Crea `scripts/inspect_silver.py` y su suite TDD `tests/test_silver_normalize.py` + `tests/test_inspect_silver.py`.
+
+4. Validación obligatoria antes de terminar:
+   - Corre `.venv/bin/pytest -v` (100% tests en verde) y `cargo test` para asegurar no regresión en Rust.
+   - Ejecuta `pipeline/silver_normalize.py` sobre los 250 SKUs reales de `data/bronze/dt=2026-11-14/` ( y si quieres, suma una corrida corta de `wong` con el ingestor Rust para tener las 4 cadenas en `dt=2026-11-14`).
+   - Ejecuta `scripts/inspect_silver.py` y muéstrame las métricas reales de cobertura de `normalization_status == "ok"`, distribución de `unit_price_std`, validación de checksum EAN y una muestra de 15 filas normalizadas de las 4 cadenas.
+
 ```
