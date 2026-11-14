@@ -58,6 +58,7 @@ pub async fn run_ingest(
     for category in &config.categories {
         let mut offset = 0usize;
         let mut pages_completed_total = 0usize;
+        let mut effective_page_size = config.page_size;
 
         if config.resume {
             if let Some(cp) = checkpoints.load(slug, category)? {
@@ -71,11 +72,15 @@ pub async fn run_ingest(
                 }
                 offset = cp.next_offset;
                 pages_completed_total = cp.pages_completed;
+                if let Some(saved_ps) = cp.page_size.filter(|&ps| ps > 0) {
+                    effective_page_size = saved_ps;
+                }
                 tracing::info!(
                     retailer = slug,
                     category = %category,
                     offset = offset,
                     pages_completed = pages_completed_total,
+                    page_size = effective_page_size,
                     "Resuming category from checkpoint"
                 );
             }
@@ -85,7 +90,7 @@ pub async fn run_ingest(
         let mut latest_cp: Option<CheckpointState> = None;
         while pages_this_run < config.max_pages {
             match adapter
-                .fetch_page(category, offset, config.page_size, &base_ctx)
+                .fetch_page(category, offset, effective_page_size, &base_ctx)
                 .await
             {
                 Ok(batch) => {
@@ -112,6 +117,7 @@ pub async fn run_ingest(
                         category: category.clone(),
                         next_offset: batch.next_offset,
                         pages_completed: pages_completed_total,
+                        page_size: Some(effective_page_size),
                         extraction_run_id,
                         updated_at: Utc::now(),
                         completed,
@@ -240,13 +246,17 @@ mod tests {
     use tokio::net::TcpListener;
     use uuid::Uuid;
 
-    async fn spawn_vtex_sequence(pages: Vec<(u16, String)>) -> (String, Arc<AtomicUsize>) {
+    async fn spawn_vtex_sequence_with_requests(
+        pages: Vec<(u16, String)>,
+    ) -> (String, Arc<AtomicUsize>, Arc<std::sync::Mutex<Vec<String>>>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let pages = Arc::new(pages);
         let calls = Arc::new(AtomicUsize::new(0));
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
 
         let calls_ref = calls.clone();
+        let requests_ref = requests.clone();
         tokio::spawn(async move {
             loop {
                 let Ok((mut socket, _)) = listener.accept().await else {
@@ -254,9 +264,16 @@ mod tests {
                 };
                 let pages = pages.clone();
                 let calls = calls_ref.clone();
+                let requests = requests_ref.clone();
                 tokio::spawn(async move {
                     let mut buf = [0u8; 2048];
-                    let _ = socket.read(&mut buf).await;
+                    let n = socket.read(&mut buf).await.unwrap_or(0);
+                    let req_line = String::from_utf8_lossy(&buf[..n])
+                        .lines()
+                        .next()
+                        .unwrap_or_default()
+                        .to_string();
+                    requests.lock().unwrap().push(req_line);
                     let idx = calls.fetch_add(1, Ordering::SeqCst);
                     let (status, body) = pages.get(idx).cloned().unwrap_or((200, "[]".to_string()));
                     let reason = if status == 206 {
@@ -273,7 +290,12 @@ mod tests {
             }
         });
 
-        (format!("http://{addr}"), calls)
+        (format!("http://{addr}"), calls, requests)
+    }
+
+    async fn spawn_vtex_sequence(pages: Vec<(u16, String)>) -> (String, Arc<AtomicUsize>) {
+        let (base_url, calls, _) = spawn_vtex_sequence_with_requests(pages).await;
+        (base_url, calls)
     }
 
     fn fast_http() -> Arc<RateLimitedHttpClient> {
@@ -374,6 +396,7 @@ mod tests {
                 category: "done_cat".to_string(),
                 next_offset: 20,
                 pages_completed: 1,
+                page_size: Some(20),
                 extraction_run_id: Uuid::new_v4(),
                 updated_at: Utc::now(),
                 completed: true,
@@ -385,6 +408,7 @@ mod tests {
                 category: "pending_cat".to_string(),
                 next_offset: 20,
                 pages_completed: 1,
+                page_size: Some(20),
                 extraction_run_id: Uuid::new_v4(),
                 updated_at: Utc::now(),
                 completed: false,
@@ -489,5 +513,75 @@ mod tests {
             cp_store.load("plazavea", "lacteos").unwrap().is_none(),
             "checkpoint must not be persisted when Parquet write fails"
         );
+    }
+
+    #[tokio::test]
+    async fn run_ingest_resume_uses_saved_checkpoint_page_size_when_cli_differs() {
+        let dir = TempDir::new().unwrap();
+        let store = CheckpointStore::new(dir.path());
+        store
+            .save(&CheckpointState {
+                retailer: "metro".to_string(),
+                category: "lacteos".to_string(),
+                next_offset: 10,
+                pages_completed: 1,
+                page_size: Some(10),
+                extraction_run_id: Uuid::new_v4(),
+                updated_at: Utc::now(),
+                completed: false,
+            })
+            .unwrap();
+        store
+            .save(&CheckpointState {
+                retailer: "metro".to_string(),
+                category: "abarrotes".to_string(),
+                next_offset: 5,
+                pages_completed: 1,
+                page_size: None,
+                extraction_run_id: Uuid::new_v4(),
+                updated_at: Utc::now(),
+                completed: false,
+            })
+            .unwrap();
+
+        let page_json = r#"[{"productId":"700","productName":"Yogurt","items":[{"itemId":"7001","ean":"","name":"Yogurt","sellers":[]}]}]"#;
+        let (base_url, _, requests) = spawn_vtex_sequence_with_requests(vec![
+            (200, page_json.to_string()),
+            (200, page_json.to_string()),
+        ])
+        .await;
+
+        let http = fast_http();
+        let adapter = VtexAdapter::with_base_url(VtexRetailer::Metro, &base_url, http.clone());
+        let cfg = IngestConfig {
+            retailer: "metro".to_string(),
+            categories: vec!["lacteos".to_string(), "abarrotes".to_string()],
+            page_size: 25,
+            max_pages: 1,
+            output_dir: dir.path().to_path_buf(),
+            resume: true,
+            market_id: "PE".to_string(),
+            postal_code: None,
+        };
+
+        run_ingest(&adapter, &http, &cfg).await.unwrap();
+
+        let recorded = requests.lock().unwrap().clone();
+        assert_eq!(recorded.len(), 2);
+        assert!(
+            recorded[0].contains("_from=10&_to=19"),
+            "expected saved checkpoint page_size=10 (_from=10&_to=19), got: {}",
+            recorded[0]
+        );
+        assert!(
+            recorded[1].contains("_from=5&_to=29"),
+            "expected fallback to CLI page_size=25 when checkpoint page_size is None (_from=5&_to=29), got: {}",
+            recorded[1]
+        );
+
+        let lacteos_cp = store.load("metro", "lacteos").unwrap().unwrap();
+        assert_eq!(lacteos_cp.page_size, Some(10));
+        let abarrotes_cp = store.load("metro", "abarrotes").unwrap().unwrap();
+        assert_eq!(abarrotes_cp.page_size, Some(25));
     }
 }

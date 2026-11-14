@@ -1,32 +1,228 @@
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{anyhow, Context};
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use tokio::sync::Mutex;
 
 use crate::adapter::{FetchContext, PageBatch, RetailerAdapter};
 use crate::adapters::{absolutize_url, encode_url_segment, value_as_string};
 use crate::dedup::compute_payload_hash;
-use crate::domain::{normalize_opt_string, Product, SkuItem};
+use crate::domain::{normalize_opt_string, validate_gtin_mod10, Product, SkuItem};
 use crate::http::RateLimitedHttpClient;
 
 const TOTTUS_BASE_URL: &str = "https://tottus.falabella.com.pe";
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TottusCacheEntry {
+    pub ean: Option<String>,
+    pub available_qty: Option<i64>,
+    pub in_stock: Option<bool>,
+    #[serde(default)]
+    pub seller_sku_id: Option<String>,
+    #[serde(default)]
+    pub source: String,
+    #[serde(default)]
+    pub pdp_checked: bool,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TottusPdpCache {
+    path: Option<PathBuf>,
+    entries: BTreeMap<String, TottusCacheEntry>,
+    dirty: bool,
+}
+
+impl TottusPdpCache {
+    pub fn load(path: impl AsRef<Path>) -> anyhow::Result<Self> {
+        let raw_path = path.as_ref();
+        let normalized_path = if raw_path
+            .parent()
+            .is_some_and(|parent| parent.as_os_str().is_empty())
+        {
+            PathBuf::from(".").join(raw_path)
+        } else {
+            raw_path.to_path_buf()
+        };
+
+        let entries = if normalized_path.exists() {
+            let bytes = fs::read(&normalized_path).with_context(|| {
+                format!(
+                    "failed to read Tottus PDP cache at {}",
+                    normalized_path.display()
+                )
+            })?;
+            serde_json::from_slice(&bytes).with_context(|| {
+                format!(
+                    "failed to parse Tottus PDP cache at {}",
+                    normalized_path.display()
+                )
+            })?
+        } else {
+            BTreeMap::new()
+        };
+
+        Ok(Self {
+            path: Some(normalized_path),
+            entries,
+            dirty: false,
+        })
+    }
+
+    fn in_memory() -> Self {
+        Self {
+            path: None,
+            entries: BTreeMap::new(),
+            dirty: false,
+        }
+    }
+
+    pub fn get(&self, sku_id: &str) -> Option<&TottusCacheEntry> {
+        self.entries.get(sku_id)
+    }
+
+    pub fn entries(&self) -> &BTreeMap<String, TottusCacheEntry> {
+        &self.entries
+    }
+
+    pub fn record_pdp_enrichment(&mut self, sku_id: &str, enrichment: &TottusPdpEnrichment) {
+        let existing = self.entries.get(sku_id);
+        let existing_valid_ean = existing
+            .and_then(|e| e.ean.as_deref())
+            .and_then(validate_gtin_mod10);
+        let merged_ean = enrichment
+            .ean
+            .as_deref()
+            .and_then(validate_gtin_mod10)
+            .or(existing_valid_ean);
+
+        let entry = TottusCacheEntry {
+            ean: merged_ean,
+            available_qty: enrichment
+                .available_qty
+                .or_else(|| existing.and_then(|e| e.available_qty)),
+            in_stock: enrichment
+                .in_stock
+                .or_else(|| existing.and_then(|e| e.in_stock)),
+            seller_sku_id: enrichment
+                .seller_sku_id
+                .clone()
+                .or_else(|| existing.and_then(|e| e.seller_sku_id.clone())),
+            source: "tottus_pdp_ssr".to_string(),
+            pdp_checked: true,
+            updated_at: Utc::now(),
+        };
+        self.entries.insert(sku_id.to_string(), entry);
+        self.dirty = true;
+    }
+
+    pub fn persist_if_dirty(&mut self) -> anyhow::Result<()> {
+        if !self.dirty {
+            return Ok(());
+        }
+        let Some(path) = &self.path else {
+            self.dirty = false;
+            return Ok(());
+        };
+        let payload = serde_json::to_vec_pretty(&self.entries)?;
+        crate::atomic_write(path, &payload)?;
+        self.dirty = false;
+        Ok(())
+    }
+}
+
 pub struct FalabellaListingAdapter {
     base_url: String,
     http: Arc<RateLimitedHttpClient>,
+    enrich_pdp: bool,
+    cache_path: Option<PathBuf>,
+    cache: Mutex<Option<TottusPdpCache>>,
 }
 
 impl FalabellaListingAdapter {
     pub fn new_tottus(http: Arc<RateLimitedHttpClient>) -> Self {
-        Self::with_base_url(TOTTUS_BASE_URL, http)
+        Self::with_enrichment(TOTTUS_BASE_URL, http, false, None)
     }
 
     pub fn with_base_url(base_url: impl Into<String>, http: Arc<RateLimitedHttpClient>) -> Self {
+        Self::with_enrichment(base_url, http, false, None)
+    }
+
+    pub fn new_tottus_with_enrichment(
+        http: Arc<RateLimitedHttpClient>,
+        enrich_pdp: bool,
+        cache_path: Option<PathBuf>,
+    ) -> Self {
+        Self::with_enrichment(TOTTUS_BASE_URL, http, enrich_pdp, cache_path)
+    }
+
+    pub fn with_enrichment(
+        base_url: impl Into<String>,
+        http: Arc<RateLimitedHttpClient>,
+        enrich_pdp: bool,
+        cache_path: Option<PathBuf>,
+    ) -> Self {
         Self {
             base_url: base_url.into().trim_end_matches('/').to_string(),
             http,
+            enrich_pdp,
+            cache_path,
+            cache: Mutex::new(None),
         }
+    }
+
+    async fn apply_cache_and_collect_pdp_targets(
+        &self,
+        products: &mut [Product],
+    ) -> anyhow::Result<Vec<(String, String)>> {
+        let mut guard = self.cache.lock().await;
+        if guard.is_none() {
+            let loaded = match &self.cache_path {
+                Some(path) => TottusPdpCache::load(path)?,
+                None if self.enrich_pdp => TottusPdpCache::in_memory(),
+                None => return Ok(Vec::new()),
+            };
+            *guard = Some(loaded);
+        }
+
+        let cache = guard.as_ref().expect("cache initialized above");
+        let mut to_fetch = Vec::new();
+        let mut queued_skus = HashSet::new();
+
+        for product in products.iter_mut() {
+            for sku in &mut product.skus {
+                let cache_entry = cache.get(&sku.sku_id);
+                if let Some(entry) = cache_entry {
+                    if sku.ean.is_none() {
+                        sku.ean = entry.ean.as_deref().and_then(validate_gtin_mod10);
+                    }
+                    if sku.available_qty != Some(0) {
+                        if let Some(qty) = entry.available_qty {
+                            sku.available_qty = Some(qty);
+                        }
+                    }
+                }
+
+                if self.enrich_pdp
+                    && sku.ean.is_none()
+                    && cache_entry.is_none_or(|e| !e.pdp_checked)
+                {
+                    if let Some(url) = product.product_url.as_ref() {
+                        if queued_skus.insert(sku.sku_id.clone()) {
+                            to_fetch.push((sku.sku_id.clone(), url.clone()));
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(to_fetch)
     }
 }
 
@@ -100,7 +296,9 @@ fn parse_price_value(raw: &Value) -> Option<f64> {
     }
 }
 
-fn extract_falabella_prices(item: &Value) -> (Option<f64>, Option<f64>, Option<f64>) {
+fn extract_falabella_prices(
+    item: &Value,
+) -> (Option<f64>, Option<f64>, Option<f64>, Option<String>) {
     let mut list_price: Option<f64> = None;
     let mut internet_price: Option<f64> = None;
     let mut event_price: Option<f64> = None;
@@ -130,8 +328,351 @@ fn extract_falabella_prices(item: &Value) -> (Option<f64>, Option<f64>, Option<f
         (a, b) => a.or(b),
     }
     .or(list_price);
+    let card_program = card_price.map(|_| "CMR".to_string());
 
-    (list_price, selling_price, card_price)
+    (list_price, selling_price, card_price, card_program)
+}
+
+fn extract_gtin_from_value(val: &Value) -> Option<String> {
+    match val {
+        Value::String(s) => validate_gtin_mod10(s),
+        Value::Number(n) => validate_gtin_mod10(&n.to_string()),
+        Value::Array(arr) => arr.iter().find_map(extract_gtin_from_value),
+        _ => None,
+    }
+}
+
+fn spec_key_mentions_gtin(key: &str) -> bool {
+    let lower = key.to_lowercase();
+    lower.contains("ean")
+        || lower.contains("gtin")
+        || lower.contains("código de barras")
+        || lower.contains("codigo de barras")
+}
+
+fn extract_gtin_from_specs(specs: &Value) -> Option<String> {
+    match specs {
+        Value::Array(entries) => entries.iter().find_map(|entry| {
+            let mentions_gtin = ["name", "id", "label", "key"]
+                .iter()
+                .filter_map(|field| entry.get(field).and_then(|v| v.as_str()))
+                .any(spec_key_mentions_gtin);
+            if !mentions_gtin {
+                return None;
+            }
+            ["value", "values", "val"]
+                .iter()
+                .filter_map(|field| entry.get(field))
+                .find_map(extract_gtin_from_value)
+        }),
+        Value::Object(map) => map.iter().find_map(|(key, val)| {
+            if spec_key_mentions_gtin(key) {
+                extract_gtin_from_value(val)
+            } else {
+                None
+            }
+        }),
+        _ => None,
+    }
+}
+
+pub fn extract_tottus_listing_ean(item: &Value) -> Option<String> {
+    for field in ["ean", "gtin13", "gtin", "barcode"] {
+        if let Some(ean) = item.get(field).and_then(extract_gtin_from_value) {
+            return Some(ean);
+        }
+    }
+    for spec_field in ["topSpecifications", "specifications"] {
+        if let Some(ean) = item.get(spec_field).and_then(extract_gtin_from_specs) {
+            return Some(ean);
+        }
+    }
+    None
+}
+
+fn parse_non_negative_i64(val: &Value) -> Option<i64> {
+    val.as_i64()
+        .filter(|&n| n >= 0)
+        .or_else(|| val.as_u64().and_then(|u| i64::try_from(u).ok()))
+        .or_else(|| {
+            val.as_str()
+                .and_then(|s| s.trim().parse::<i64>().ok())
+                .filter(|&n| n >= 0)
+        })
+}
+
+pub fn extract_tottus_listing_stock(item: &Value, selling_price: Option<f64>) -> Option<i64> {
+    let out_of_stock = item.get("isOutOfStock").and_then(|v| v.as_bool()) == Some(true)
+        || item
+            .pointer("/availability/isOutOfStock")
+            .and_then(|v| v.as_bool())
+            == Some(true);
+    if out_of_stock {
+        return Some(0);
+    }
+
+    for field in ["availableQuantity", "stock", "maxOnCartAmount"] {
+        if let Some(qty) = item.get(field).and_then(parse_non_negative_i64) {
+            return Some(qty);
+        }
+    }
+
+    let has_offer_signal = item.get("offeringId").is_some_and(|v| !v.is_null())
+        || item.get("availability").is_some_and(|v| !v.is_null());
+    if selling_price.is_some() && has_offer_signal {
+        return Some(1);
+    }
+
+    None
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TottusPdpEnrichment {
+    pub ean: Option<String>,
+    pub available_qty: Option<i64>,
+    pub in_stock: Option<bool>,
+    pub seller_sku_id: Option<String>,
+}
+
+fn parse_positive_i64(val: &Value) -> Option<i64> {
+    parse_non_negative_i64(val).filter(|&n| n > 0)
+}
+
+fn extract_json_ld_blocks(html: &str) -> Vec<Value> {
+    let lower = html.to_ascii_lowercase();
+    let mut blocks = Vec::new();
+    let mut cursor = 0usize;
+
+    while let Some(rel_start) = lower[cursor..].find("<script") {
+        let tag_start = cursor + rel_start;
+        let Some(rel_gt) = lower[tag_start..].find('>') else {
+            break;
+        };
+        let tag_end = tag_start + rel_gt;
+        let attrs = &lower[tag_start..=tag_end];
+        let body_start = tag_end + 1;
+        let Some(rel_close) = lower[body_start..].find("</script>") else {
+            break;
+        };
+        let body_end = body_start + rel_close;
+
+        if attrs.contains("application/ld+json") {
+            let raw_json = html[body_start..body_end].trim();
+            if let Ok(val) = serde_json::from_str::<Value>(raw_json) {
+                blocks.push(val);
+            }
+        }
+
+        cursor = body_end + "</script>".len();
+    }
+
+    blocks
+}
+
+fn is_json_ld_product(obj: &serde_json::Map<String, Value>) -> bool {
+    match obj.get("@type") {
+        Some(Value::String(s)) => s.eq_ignore_ascii_case("product"),
+        Some(Value::Array(arr)) => arr.iter().any(|v| {
+            v.as_str()
+                .is_some_and(|s| s.eq_ignore_ascii_case("product"))
+        }),
+        _ => false,
+    }
+}
+
+fn collect_json_ld_products<'a>(val: &'a Value, out: &mut Vec<&'a Value>) {
+    match val {
+        Value::Array(arr) => {
+            for item in arr {
+                collect_json_ld_products(item, out);
+            }
+        }
+        Value::Object(map) => {
+            if is_json_ld_product(map) {
+                out.push(val);
+            }
+            if let Some(graph) = map.get("@graph") {
+                collect_json_ld_products(graph, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn parse_json_ld_availability(offers: &Value) -> Option<bool> {
+    let mut saw_oos = false;
+    let slice: &[Value] = match offers {
+        Value::Array(arr) => arr.as_slice(),
+        single @ Value::Object(_) => std::slice::from_ref(single),
+        _ => return None,
+    };
+
+    for offer in slice {
+        if let Some(avail) = offer.get("availability").and_then(|v| v.as_str()) {
+            let lower = avail.to_ascii_lowercase();
+            if lower.contains("outofstock") {
+                saw_oos = true;
+            } else if lower.contains("instock") {
+                return Some(true);
+            }
+        }
+    }
+
+    if saw_oos {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+fn extract_variant_stock_limit(variant: &Value) -> Option<i64> {
+    variant
+        .get("maxOnCartAmount")
+        .and_then(parse_positive_i64)
+        .or_else(|| {
+            variant
+                .pointer("/qtyLimits/value")
+                .and_then(parse_positive_i64)
+        })
+        .or_else(|| {
+            variant
+                .get("offerings")
+                .and_then(|o| o.as_array())
+                .and_then(|arr| {
+                    arr.iter().find_map(|off| {
+                        off.get("maxOnCartAmount")
+                            .and_then(parse_positive_i64)
+                            .or_else(|| {
+                                off.pointer("/qtyLimits/value").and_then(parse_positive_i64)
+                            })
+                    })
+                })
+        })
+}
+
+pub fn parse_tottus_pdp_html(html: &str, target_sku_id: &str) -> TottusPdpEnrichment {
+    let json_ld_blocks = extract_json_ld_blocks(html);
+    let mut ld_products = Vec::new();
+    for block in &json_ld_blocks {
+        collect_json_ld_products(block, &mut ld_products);
+    }
+
+    let mut jsonld_ean: Option<String> = None;
+    let mut jsonld_in_stock: Option<bool> = None;
+
+    for prod in &ld_products {
+        if jsonld_ean.is_none() {
+            for field in ["gtin13", "gtin", "gtin12", "gtin8", "gtin14", "ean"] {
+                if let Some(ean) = prod.get(field).and_then(extract_gtin_from_value) {
+                    jsonld_ean = Some(ean);
+                    break;
+                }
+            }
+        }
+        if jsonld_in_stock.is_none() {
+            if let Some(offers) = prod.get("offers") {
+                jsonld_in_stock = parse_json_ld_availability(offers);
+            }
+        }
+    }
+
+    let next_root = extract_next_data_json(html, 200).ok();
+    let product_data = next_root
+        .as_ref()
+        .and_then(|r| r.pointer("/props/pageProps/productData"));
+    let variants = product_data
+        .and_then(|pd| pd.get("variants"))
+        .and_then(|v| v.as_array());
+    let matched_variant = variants.and_then(|arr| {
+        arr.iter()
+            .find(|v| {
+                value_as_string(v.get("id")).as_deref() == Some(target_sku_id)
+                    || value_as_string(v.get("skuId")).as_deref() == Some(target_sku_id)
+            })
+            .or_else(|| arr.first())
+    });
+
+    let next_is_oos = matched_variant
+        .and_then(|v| v.get("isOutOfStock").and_then(|b| b.as_bool()))
+        .or_else(|| product_data.and_then(|pd| pd.get("isOutOfStock").and_then(|b| b.as_bool())));
+
+    let in_stock = match next_is_oos {
+        Some(true) => Some(false),
+        Some(false) => Some(true),
+        None => jsonld_in_stock,
+    };
+
+    let available_qty = if in_stock == Some(false) {
+        Some(0)
+    } else {
+        let positive_limit = matched_variant
+            .and_then(extract_variant_stock_limit)
+            .or_else(|| {
+                product_data.and_then(|pd| {
+                    pd.get("maxOnCartAmount")
+                        .and_then(parse_positive_i64)
+                        .or_else(|| pd.pointer("/qtyLimits/value").and_then(parse_positive_i64))
+                        .or_else(|| {
+                            let stock_units = pd.get("stockUnits")?;
+                            let variant_id = matched_variant.and_then(|v| {
+                                value_as_string(v.get("id"))
+                                    .or_else(|| value_as_string(v.get("skuId")))
+                            });
+                            stock_units
+                                .get(target_sku_id)
+                                .and_then(parse_positive_i64)
+                                .or_else(|| {
+                                    variant_id
+                                        .as_deref()
+                                        .and_then(|id| stock_units.get(id))
+                                        .and_then(parse_positive_i64)
+                                })
+                        })
+                })
+            });
+
+        positive_limit.or(match in_stock {
+            Some(true) => Some(1),
+            _ => None,
+        })
+    };
+
+    let seller_sku_id = matched_variant
+        .and_then(|v| v.get("offerings"))
+        .and_then(|o| o.as_array())
+        .and_then(|arr| {
+            arr.iter()
+                .find_map(|off| value_as_string(off.get("sellerSkuId")))
+        });
+
+    let ean = jsonld_ean
+        .or_else(|| {
+            matched_variant
+                .and_then(|v| v.pointer("/attributes/specifications"))
+                .and_then(extract_gtin_from_specs)
+        })
+        .or_else(|| {
+            product_data
+                .and_then(|pd| pd.pointer("/attributes/specifications"))
+                .and_then(extract_gtin_from_specs)
+        })
+        .or_else(|| {
+            variants.and_then(|arr| {
+                arr.iter().find_map(|v| {
+                    v.pointer("/attributes/specifications")
+                        .and_then(extract_gtin_from_specs)
+                })
+            })
+        })
+        .or_else(|| matched_variant.and_then(extract_tottus_listing_ean))
+        .or_else(|| product_data.and_then(extract_tottus_listing_ean));
+
+    TottusPdpEnrichment {
+        ean,
+        available_qty,
+        in_stock,
+        seller_sku_id,
+    }
 }
 
 fn parse_results_from_root(
@@ -186,7 +727,9 @@ fn parse_results_from_root(
                 .or_else(|| item.get("sellerName"))
                 .and_then(|v| v.as_str()),
         );
-        let (list_price, selling_price, card_price) = extract_falabella_prices(item);
+        let (list_price, selling_price, card_price, card_program) = extract_falabella_prices(item);
+        let ean = extract_tottus_listing_ean(item);
+        let available_qty = extract_tottus_listing_stock(item, selling_price);
 
         products.push(Product {
             retailer: "tottus".to_string(),
@@ -210,14 +753,15 @@ fn parse_results_from_root(
             raw_payload,
             skus: vec![SkuItem {
                 sku_id,
-                ean: None,
+                ean,
                 seller_id,
                 raw_name,
                 image_url,
                 list_price,
                 selling_price,
                 card_price,
-                available_qty: None,
+                card_program,
+                available_qty,
             }],
         });
     }
@@ -289,15 +833,63 @@ impl RetailerAdapter for FalabellaListingAdapter {
         let resp = self.http.get_text(&url).await?;
         let page_ctx = ctx.clone().with_endpoint(url, resp.status);
         let root = extract_next_data_json(&resp.body, resp.status)?;
-        let products =
+        let mut products =
             parse_results_from_root(&root, &self.base_url, self.extractor_version(), &page_ctx)?;
         let has_more = has_more_pages(&root, products.len(), page_size);
+        let mut total_bytes = resp.bytes;
+
+        let to_fetch = self
+            .apply_cache_and_collect_pdp_targets(&mut products)
+            .await?;
+        if !to_fetch.is_empty() {
+            let mut fetched: HashMap<String, TottusPdpEnrichment> = HashMap::new();
+            for (sku_id, pdp_url) in to_fetch {
+                match self.http.get_text(&pdp_url).await {
+                    Ok(pdp_resp) => {
+                        total_bytes += pdp_resp.bytes;
+                        let enrichment = parse_tottus_pdp_html(&pdp_resp.body, &sku_id);
+                        fetched.insert(sku_id, enrichment);
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            sku_id = %sku_id,
+                            url = %pdp_url,
+                            error = %format!("{err:#}"),
+                            "Failed fetching Tottus PDP for enrichment; continuing listing batch"
+                        );
+                    }
+                }
+            }
+
+            if !fetched.is_empty() {
+                for product in &mut products {
+                    for sku in &mut product.skus {
+                        if let Some(enrichment) = fetched.get(&sku.sku_id) {
+                            if sku.ean.is_none() {
+                                sku.ean = enrichment.ean.as_deref().and_then(validate_gtin_mod10);
+                            }
+                            if let Some(qty) = enrichment.available_qty {
+                                sku.available_qty = Some(qty);
+                            }
+                        }
+                    }
+                }
+
+                let mut guard = self.cache.lock().await;
+                if let Some(cache) = guard.as_mut() {
+                    for (sku_id, enrichment) in &fetched {
+                        cache.record_pdp_enrichment(sku_id, enrichment);
+                    }
+                    cache.persist_if_dirty()?;
+                }
+            }
+        }
 
         Ok(PageBatch {
             products,
             has_more,
             next_offset: offset + page_size.max(1),
-            raw_bytes: resp.bytes,
+            raw_bytes: total_bytes,
             http_status: resp.status,
             latency_ms: resp.latency_ms,
         })
@@ -506,5 +1098,718 @@ mod tests {
         assert_eq!(batch.products.len(), 1);
         assert!(batch.has_more);
         assert_eq!(batch.next_offset, 20);
+    }
+
+    #[test]
+    fn falabella_sets_card_program_cmr_and_listing_stock_signals() {
+        let html = r#"<!doctype html><html><body>
+        <script id="__NEXT_DATA__" type="application/json">{
+          "props": {
+            "pageProps": {
+              "results": [
+                {
+                  "productId": "101",
+                  "skuId": "1011",
+                  "displayName": "Leche con CMR y oferta activa",
+                  "offeringId": "off-1011",
+                  "prices": [
+                    {"type": "normalPrice", "price": ["5.00"]},
+                    {"type": "internetPrice", "price": ["4.50"]},
+                    {"type": "cmrPrice", "price": ["3.90"]}
+                  ]
+                },
+                {
+                  "productId": "102",
+                  "skuId": "1021",
+                  "displayName": "Leche sin stock",
+                  "isOutOfStock": true,
+                  "maxOnCartAmount": 24,
+                  "offeringId": "off-1021",
+                  "prices": [
+                    {"type": "internetPrice", "price": ["4.50"]}
+                  ]
+                },
+                {
+                  "productId": "103",
+                  "skuId": "1031",
+                  "displayName": "Leche con stock numerico",
+                  "availableQuantity": 18,
+                  "prices": [
+                    {"type": "internetPrice", "price": ["4.50"]}
+                  ]
+                },
+                {
+                  "productId": "104",
+                  "skuId": "1041",
+                  "displayName": "Leche OOS en availability",
+                  "availability": {"isOutOfStock": true},
+                  "prices": [
+                    {"type": "internetPrice", "price": ["4.50"]}
+                  ]
+                }
+              ]
+            }
+          }
+        }</script></body></html>"#;
+
+        let adapter = FalabellaListingAdapter::new_tottus(test_http());
+        let ctx = FetchContext::for_run(Uuid::new_v4(), "PE", None);
+        let products = adapter.parse_page_payload(html, &ctx).unwrap();
+        assert_eq!(products.len(), 4);
+
+        assert_eq!(products[0].skus[0].card_price, Some(3.90));
+        assert_eq!(products[0].skus[0].card_program.as_deref(), Some("CMR"));
+        assert_eq!(products[0].skus[0].available_qty, Some(1));
+
+        assert_eq!(products[1].skus[0].card_price, None);
+        assert_eq!(products[1].skus[0].card_program, None);
+        assert_eq!(products[1].skus[0].available_qty, Some(0));
+
+        assert_eq!(products[2].skus[0].available_qty, Some(18));
+        assert_eq!(products[3].skus[0].available_qty, Some(0));
+
+        let no_signal = serde_json::json!({"productId": "105", "prices": []});
+        assert_eq!(extract_tottus_listing_stock(&no_signal, None), None);
+        let null_offer =
+            serde_json::json!({"productId": "106", "offeringId": null, "availability": null});
+        assert_eq!(extract_tottus_listing_stock(&null_offer, Some(4.5)), None);
+        let with_avail =
+            serde_json::json!({"productId": "107", "availability": {"homeDelivery": "AVAILABLE"}});
+        assert_eq!(
+            extract_tottus_listing_stock(&with_avail, Some(4.5)),
+            Some(1)
+        );
+        let with_stock_field = serde_json::json!({"productId": "108", "stock": 7});
+        assert_eq!(
+            extract_tottus_listing_stock(&with_stock_field, Some(4.5)),
+            Some(7)
+        );
+        let with_max_cart = serde_json::json!({"productId": "109", "maxOnCartAmount": 12});
+        assert_eq!(
+            extract_tottus_listing_stock(&with_max_cart, Some(4.5)),
+            Some(12)
+        );
+    }
+
+    #[test]
+    fn falabella_extracts_tottus_listing_ean_from_fields_and_specifications() {
+        let direct_gtin = serde_json::json!({
+            "ean": "null",
+            "gtin13": "7751271034142"
+        });
+        assert_eq!(
+            extract_tottus_listing_ean(&direct_gtin),
+            Some("7751271034142".to_string())
+        );
+
+        let array_barcode = serde_json::json!({
+            "barcode": ["12345", "7751271034098"]
+        });
+        assert_eq!(
+            extract_tottus_listing_ean(&array_barcode),
+            Some("7751271034098".to_string())
+        );
+
+        let top_specs = serde_json::json!({
+            "topSpecifications": [
+                {"name": "Marca", "value": "GLORIA"},
+                {"name": "Código de barras", "value": "7751271033664"}
+            ]
+        });
+        assert_eq!(
+            extract_tottus_listing_ean(&top_specs),
+            Some("7751271033664".to_string())
+        );
+
+        let specs_by_id = serde_json::json!({
+            "specifications": [
+                {"id": "registro_sanitario", "value": "20181512"},
+                {"id": "gtin", "values": ["invalid", "7751271034128"]}
+            ]
+        });
+        assert_eq!(
+            extract_tottus_listing_ean(&specs_by_id),
+            Some("7751271034128".to_string())
+        );
+
+        let invalid_only = serde_json::json!({
+            "ean": "7751271034143",
+            "gtin": "null"
+        });
+        assert_eq!(extract_tottus_listing_ean(&invalid_only), None);
+    }
+
+    #[test]
+    fn parse_tottus_pdp_html_extracts_json_ld_gtin_and_next_data_stock_and_seller_sku() {
+        let html = r#"<!doctype html><html><head>
+        <script type="application/ld+json">{
+          "@context": "https://schema.org",
+          "@type": "BreadcrumbList",
+          "itemListElement": []
+        }</script>
+        <script type="application/ld+json">{
+          "@context": "https://schema.org",
+          "@type": "Product",
+          "name": "Leche Gloria Light",
+          "gtin13": "7751271034142",
+          "offers": [
+            {"@type": "Offer", "availability": "https://schema.org/InStock", "price": "24.90"}
+          ]
+        }</script>
+        </head><body>
+        <script id="__NEXT_DATA__" type="application/json">{
+          "props": {
+            "pageProps": {
+              "productData": {
+                "isOutOfStock": false,
+                "stockUnits": {"129087939": 5, "129087940": 0},
+                "variants": [
+                  {
+                    "id": "129087939",
+                    "maxOnCartAmount": 6,
+                    "offerings": [{"sellerSkuId": "SELL-939"}]
+                  },
+                  {
+                    "id": "129087940",
+                    "maxOnCartAmount": 24,
+                    "offerings": [{"sellerSkuId": "SELL-940"}]
+                  }
+                ]
+              }
+            }
+          }
+        }</script>
+        </body></html>"#;
+
+        let parsed = parse_tottus_pdp_html(html, "129087940");
+        assert_eq!(
+            parsed,
+            TottusPdpEnrichment {
+                ean: Some("7751271034142".to_string()),
+                available_qty: Some(24),
+                in_stock: Some(true),
+                seller_sku_id: Some("SELL-940".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_tottus_pdp_html_handles_graph_json_ld_spec_fallback_and_qty_limits() {
+        let html_graph_qty_limit = r#"<html><head>
+        <script type='application/ld+json'>{
+          "@context": "https://schema.org",
+          "@graph": [
+            {"@type": "WebPage"},
+            {
+              "@type": "Product",
+              "gtin13": "null",
+              "offers": {"@type": "Offer", "availability": "https://schema.org/InStock"}
+            }
+          ]
+        }</script></head><body>
+        <script id="__NEXT_DATA__" type="application/json">{
+          "props": {
+            "pageProps": {
+              "productData": {
+                "isOutOfStock": false,
+                "attributes": {
+                  "specifications": [{"name": "Código de barras", "value": "7751271034098"}]
+                },
+                "variants": [
+                  {
+                    "id": "FALLBACK-SKU",
+                    "qtyLimits": {"value": 12},
+                    "offerings": [{"sellerSkuId": "SELLER-1"}]
+                  }
+                ]
+              }
+            }
+          }
+        }</script></body></html>"#;
+
+        let parsed = parse_tottus_pdp_html(html_graph_qty_limit, "MISSING-SKU");
+        assert_eq!(parsed.ean.as_deref(), Some("7751271034098"));
+        assert_eq!(parsed.in_stock, Some(true));
+        assert_eq!(parsed.available_qty, Some(12));
+        assert_eq!(parsed.seller_sku_id.as_deref(), Some("SELLER-1"));
+
+        let html_stock_units = r#"<html><body>
+        <script id="__NEXT_DATA__" type="application/json">{
+          "props": {"pageProps": {"productData": {
+            "isOutOfStock": false,
+            "stockUnits": {"555": 9},
+            "variants": [{
+              "id": "555",
+              "attributes": {"specifications": [{"id": "ean", "value": "7751271033664"}]}
+            }]
+          }}}
+        }</script></body></html>"#;
+        let parsed_units = parse_tottus_pdp_html(html_stock_units, "555");
+        assert_eq!(parsed_units.ean.as_deref(), Some("7751271033664"));
+        assert_eq!(parsed_units.in_stock, Some(true));
+        assert_eq!(parsed_units.available_qty, Some(9));
+
+        let html_instock_zero_units_no_limit = r#"<html><body>
+        <script type="application/ld+json">[{"@type": "Product", "offers": {"availability": "InStock"}}]</script>
+        <script id="__NEXT_DATA__" type="application/json">{
+          "props": {"pageProps": {"productData": {
+            "isOutOfStock": false,
+            "stockUnits": {"777": 0},
+            "variants": [{"id": "777"}]
+          }}}
+        }</script></body></html>"#;
+        let parsed_default_one = parse_tottus_pdp_html(html_instock_zero_units_no_limit, "777");
+        assert_eq!(parsed_default_one.in_stock, Some(true));
+        assert_eq!(parsed_default_one.available_qty, Some(1));
+    }
+
+    #[test]
+    fn parse_tottus_pdp_html_rejects_literal_null_gtin_while_preserving_stock() {
+        let html = r#"<!doctype html><html><head>
+        <script type="application/ld+json">{
+          "@context": "https://schema.org",
+          "@type": "Product",
+          "gtin13": "null",
+          "gtin": "null",
+          "offers": {"@type": "Offer", "availability": "https://schema.org/InStock"}
+        }</script>
+        </head><body>
+        <script id="__NEXT_DATA__" type="application/json">{
+          "props": {
+            "pageProps": {
+              "productData": {
+                "isOutOfStock": false,
+                "stockUnits": {"113705686": 0},
+                "variants": [
+                  {
+                    "id": "113705686",
+                    "maxOnCartAmount": 24,
+                    "offerings": [{"sellerSkuId": "20456789"}]
+                  }
+                ]
+              }
+            }
+          }
+        }</script>
+        </body></html>"#;
+
+        let parsed = parse_tottus_pdp_html(html, "113705686");
+        assert_eq!(parsed.ean, None);
+        assert_eq!(parsed.in_stock, Some(true));
+        assert_eq!(parsed.available_qty, Some(24));
+        assert_eq!(parsed.seller_sku_id.as_deref(), Some("20456789"));
+    }
+
+    #[test]
+    fn parse_tottus_pdp_html_returns_zero_qty_when_out_of_stock() {
+        let html_both_oos = r#"<html><head>
+        <script type="application/ld+json">{
+          "@type": "Product",
+          "gtin13": "7751271034142",
+          "offers": {"availability": "https://schema.org/OutOfStock"}
+        }</script></head><body>
+        <script id="__NEXT_DATA__" type="application/json">{
+          "props": {"pageProps": {"productData": {
+            "isOutOfStock": true,
+            "variants": [{"id": "888", "maxOnCartAmount": 24}]
+          }}}
+        }</script></body></html>"#;
+        let parsed = parse_tottus_pdp_html(html_both_oos, "888");
+        assert_eq!(parsed.ean.as_deref(), Some("7751271034142"));
+        assert_eq!(parsed.in_stock, Some(false));
+        assert_eq!(parsed.available_qty, Some(0));
+
+        let html_jsonld_oos_only = r#"<html><head>
+        <script type="application/ld+json">{
+          "@type": "Product",
+          "offers": [{"availability": "https://schema.org/OutOfStock"}]
+        }</script></head></html>"#;
+        let parsed_ld = parse_tottus_pdp_html(html_jsonld_oos_only, "888");
+        assert_eq!(parsed_ld.in_stock, Some(false));
+        assert_eq!(parsed_ld.available_qty, Some(0));
+    }
+
+    #[test]
+    fn tottus_pdp_cache_preserves_valid_ean_when_pdp_returns_null_and_persists_atomically() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let cache_path = dir.path().join("tottus_ean_cache.json");
+
+        let mut initial = std::collections::BTreeMap::new();
+        initial.insert(
+            "129087925".to_string(),
+            TottusCacheEntry {
+                ean: Some("7751271034098".to_string()),
+                available_qty: None,
+                in_stock: None,
+                seller_sku_id: None,
+                source: "vtex_crossref_gtin13_seed".to_string(),
+                pdp_checked: false,
+                updated_at: chrono::Utc::now(),
+            },
+        );
+        std::fs::write(&cache_path, serde_json::to_vec_pretty(&initial).unwrap()).unwrap();
+
+        let mut cache = TottusPdpCache::load(&cache_path).unwrap();
+        let pdp_null_ean = TottusPdpEnrichment {
+            ean: None,
+            available_qty: Some(24),
+            in_stock: Some(true),
+            seller_sku_id: Some("SELL-129".to_string()),
+        };
+        cache.record_pdp_enrichment("129087925", &pdp_null_ean);
+        cache.persist_if_dirty().unwrap();
+
+        let reloaded = TottusPdpCache::load(&cache_path).unwrap();
+        let entry = reloaded.get("129087925").unwrap();
+        assert_eq!(entry.ean.as_deref(), Some("7751271034098"));
+        assert_eq!(entry.available_qty, Some(24));
+        assert_eq!(entry.in_stock, Some(true));
+        assert_eq!(entry.seller_sku_id.as_deref(), Some("SELL-129"));
+        assert!(entry.pdp_checked);
+    }
+
+    #[tokio::test]
+    async fn falabella_fetch_page_enriches_pdp_only_for_uncached_skus_and_caches_results() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let cache_path = dir.path().join("tottus_ean_cache.json");
+
+        let mut seed = std::collections::BTreeMap::new();
+        seed.insert(
+            "1001".to_string(),
+            TottusCacheEntry {
+                ean: Some("7751271034098".to_string()),
+                available_qty: None,
+                in_stock: None,
+                seller_sku_id: None,
+                source: "vtex_crossref_gtin13_seed".to_string(),
+                pdp_checked: false,
+                updated_at: chrono::Utc::now(),
+            },
+        );
+        std::fs::write(&cache_path, serde_json::to_vec_pretty(&seed).unwrap()).unwrap();
+
+        let listing_body = r#"<!doctype html><html><body>
+        <script id="__NEXT_DATA__" type="application/json">{
+          "props": {
+            "pageProps": {
+              "pagination": {"count": 3, "perPage": 20, "currentPage": 1, "totalPages": 1},
+              "results": [
+                {
+                  "productId": "P1001",
+                  "skuId": "1001",
+                  "displayName": "Leche Preseeded",
+                  "url": "/tottus-pe/product/P1001/leche-preseeded/1001",
+                  "offeringId": "off-1001",
+                  "prices": [{"type": "internetPrice", "price": ["24.90"]}]
+                },
+                {
+                  "productId": "P1002",
+                  "skuId": "1002",
+                  "displayName": "Leche Null Gtin",
+                  "url": "/tottus-pe/product/P1002/leche-null-gtin/1002",
+                  "offeringId": "off-1002",
+                  "prices": [
+                    {"type": "internetPrice", "price": ["18.50"]},
+                    {"type": "cmrPrice", "price": ["16.90"]}
+                  ]
+                },
+                {
+                  "productId": "P1003",
+                  "skuId": "1003",
+                  "displayName": "Arroz Con Gtin OOS",
+                  "url": "/tottus-pe/product/P1003/arroz-con-gtin/1003",
+                  "offeringId": "off-1003",
+                  "prices": [{"type": "normalPrice", "price": ["21.00"]}]
+                }
+              ]
+            }
+          }
+        }</script></body></html>"#
+            .to_string();
+
+        let pdp_1002_body = r#"<!doctype html><html><head>
+        <script type="application/ld+json">{
+          "@type": "Product",
+          "gtin13": "null",
+          "offers": {"@type": "Offer", "availability": "https://schema.org/InStock"}
+        }</script></head><body>
+        <script id="__NEXT_DATA__" type="application/json">{
+          "props": {"pageProps": {"productData": {
+            "isOutOfStock": false,
+            "stockUnits": {"1002": 0},
+            "variants": [{"id": "1002", "maxOnCartAmount": 24, "offerings": [{"sellerSkuId": "S1002"}]}]
+          }}}
+        }</script></body></html>"#
+            .to_string();
+
+        let pdp_1003_body = r#"<!doctype html><html><head>
+        <script type="application/ld+json">{
+          "@type": "Product",
+          "gtin13": "7751271034142",
+          "offers": {"@type": "Offer", "availability": "https://schema.org/OutOfStock"}
+        }</script></head><body>
+        <script id="__NEXT_DATA__" type="application/json">{
+          "props": {"pageProps": {"productData": {
+            "isOutOfStock": true,
+            "variants": [{"id": "1003", "maxOnCartAmount": 12, "offerings": [{"sellerSkuId": "S1003"}]}]
+          }}}
+        }</script></body></html>"#
+            .to_string();
+
+        let expected_batch1_bytes = listing_body.len() + pdp_1002_body.len() + pdp_1003_body.len();
+        let expected_listing_bytes = listing_body.len();
+
+        let search_hits = Arc::new(AtomicUsize::new(0));
+        let pdp_1001_hits = Arc::new(AtomicUsize::new(0));
+        let pdp_1002_hits = Arc::new(AtomicUsize::new(0));
+        let pdp_1003_hits = Arc::new(AtomicUsize::new(0));
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let search_hits_srv = search_hits.clone();
+        let pdp_1001_hits_srv = pdp_1001_hits.clone();
+        let pdp_1002_hits_srv = pdp_1002_hits.clone();
+        let pdp_1003_hits_srv = pdp_1003_hits.clone();
+
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let listing_body = listing_body.clone();
+                let pdp_1002_body = pdp_1002_body.clone();
+                let pdp_1003_body = pdp_1003_body.clone();
+                let search_hits_srv = search_hits_srv.clone();
+                let pdp_1001_hits_srv = pdp_1001_hits_srv.clone();
+                let pdp_1002_hits_srv = pdp_1002_hits_srv.clone();
+                let pdp_1003_hits_srv = pdp_1003_hits_srv.clone();
+
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let n = socket.read(&mut buf).await.unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]);
+                    let path = req
+                        .lines()
+                        .next()
+                        .and_then(|line| line.split_whitespace().nth(1))
+                        .unwrap_or("/");
+
+                    let (status, reason, body) = if path.starts_with("/tottus-pe/search") {
+                        search_hits_srv.fetch_add(1, Ordering::SeqCst);
+                        (200, "OK", listing_body)
+                    } else if path.contains("/1001") {
+                        pdp_1001_hits_srv.fetch_add(1, Ordering::SeqCst);
+                        (200, "OK", "<html></html>".to_string())
+                    } else if path.contains("/1002") {
+                        pdp_1002_hits_srv.fetch_add(1, Ordering::SeqCst);
+                        (200, "OK", pdp_1002_body)
+                    } else if path.contains("/1003") {
+                        pdp_1003_hits_srv.fetch_add(1, Ordering::SeqCst);
+                        (200, "OK", pdp_1003_body)
+                    } else {
+                        (404, "Not Found", "missing".to_string())
+                    };
+
+                    let resp = format!(
+                        "HTTP/1.1 {status} {reason}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = socket.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+
+        let adapter = FalabellaListingAdapter::with_enrichment(
+            format!("http://{addr}"),
+            test_http(),
+            true,
+            Some(cache_path.clone()),
+        );
+        let ctx = FetchContext::for_run(Uuid::new_v4(), "PE", None);
+
+        // First fetch: 1 listing + 2 uncached PDPs (1002 and 1003), 0 PDP for pre-seeded 1001.
+        let batch1 = adapter.fetch_page("leche", 0, 20, &ctx).await.unwrap();
+        assert_eq!(batch1.products.len(), 3);
+        assert_eq!(batch1.raw_bytes, expected_batch1_bytes);
+        assert_eq!(search_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(pdp_1001_hits.load(Ordering::SeqCst), 0);
+        assert_eq!(pdp_1002_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(pdp_1003_hits.load(Ordering::SeqCst), 1);
+
+        assert_eq!(
+            batch1.products[0].skus[0].ean.as_deref(),
+            Some("7751271034098")
+        );
+        assert_eq!(batch1.products[0].skus[0].available_qty, Some(1));
+
+        assert_eq!(batch1.products[1].skus[0].ean, None);
+        assert_eq!(batch1.products[1].skus[0].available_qty, Some(24));
+        assert_eq!(
+            batch1.products[1].skus[0].card_program.as_deref(),
+            Some("CMR")
+        );
+
+        assert_eq!(
+            batch1.products[2].skus[0].ean.as_deref(),
+            Some("7751271034142")
+        );
+        assert_eq!(batch1.products[2].skus[0].available_qty, Some(0));
+
+        // Verify persisted cache contents
+        let saved_cache = TottusPdpCache::load(&cache_path).unwrap();
+        assert_eq!(
+            saved_cache.get("1001").and_then(|e| e.ean.as_deref()),
+            Some("7751271034098")
+        );
+        assert!(saved_cache
+            .get("1002")
+            .is_some_and(|e| e.pdp_checked && e.ean.is_none() && e.available_qty == Some(24)));
+        assert!(saved_cache.get("1003").is_some_and(|e| e.pdp_checked
+            && e.ean.as_deref() == Some("7751271034142")
+            && e.available_qty == Some(0)));
+
+        // Second fetch: ZERO PDP requests, only 1 listing request!
+        let batch2 = adapter.fetch_page("leche", 0, 20, &ctx).await.unwrap();
+        assert_eq!(batch2.raw_bytes, expected_listing_bytes);
+        assert_eq!(search_hits.load(Ordering::SeqCst), 2);
+        assert_eq!(pdp_1001_hits.load(Ordering::SeqCst), 0);
+        assert_eq!(pdp_1002_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(pdp_1003_hits.load(Ordering::SeqCst), 1);
+
+        assert_eq!(
+            batch2.products[0].skus[0].ean.as_deref(),
+            Some("7751271034098")
+        );
+        assert_eq!(batch2.products[1].skus[0].available_qty, Some(24));
+        assert_eq!(
+            batch2.products[2].skus[0].ean.as_deref(),
+            Some("7751271034142")
+        );
+        assert_eq!(batch2.products[2].skus[0].available_qty, Some(0));
+
+        // Cache-only mode (enrich_pdp = false) still enriches from persisted cache with zero PDP hits.
+        let cache_only_adapter = FalabellaListingAdapter::with_enrichment(
+            format!("http://{addr}"),
+            test_http(),
+            false,
+            Some(cache_path.clone()),
+        );
+        let batch3 = cache_only_adapter
+            .fetch_page("leche", 0, 20, &ctx)
+            .await
+            .unwrap();
+        assert_eq!(batch3.raw_bytes, expected_listing_bytes);
+        assert_eq!(search_hits.load(Ordering::SeqCst), 3);
+        assert_eq!(pdp_1001_hits.load(Ordering::SeqCst), 0);
+        assert_eq!(pdp_1002_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(pdp_1003_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            batch3.products[0].skus[0].ean.as_deref(),
+            Some("7751271034098")
+        );
+        assert_eq!(batch3.products[1].skus[0].available_qty, Some(24));
+        assert_eq!(
+            batch3.products[2].skus[0].ean.as_deref(),
+            Some("7751271034142")
+        );
+        assert_eq!(batch3.products[2].skus[0].available_qty, Some(0));
+    }
+
+    #[tokio::test]
+    async fn falabella_fetch_page_continues_when_single_pdp_request_fails() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let cache_path = dir.path().join("tottus_ean_cache.json");
+
+        let listing_body = r#"<html><script id="__NEXT_DATA__" type="application/json">{
+          "props": {
+            "pageProps": {
+              "results": [
+                {
+                  "productId": "P2001",
+                  "skuId": "2001",
+                  "displayName": "Broken PDP",
+                  "url": "/tottus-pe/product/P2001/broken/2001",
+                  "offeringId": "off-2001",
+                  "prices": [{"type": "internetPrice", "price": ["9.90"]}]
+                },
+                {
+                  "productId": "P2002",
+                  "skuId": "2002",
+                  "displayName": "Good PDP",
+                  "url": "/tottus-pe/product/P2002/good/2002",
+                  "offeringId": "off-2002",
+                  "prices": [{"type": "internetPrice", "price": ["12.90"]}]
+                }
+              ]
+            }
+          }
+        }</script></html>"#
+            .to_string();
+
+        let good_pdp = r#"<html><script type="application/ld+json">{
+          "@type": "Product",
+          "gtin13": "7751271034142",
+          "offers": {"availability": "https://schema.org/InStock"}
+        }</script></html>"#
+            .to_string();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let listing_body = listing_body.clone();
+                let good_pdp = good_pdp.clone();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let n = socket.read(&mut buf).await.unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]);
+                    let path = req
+                        .lines()
+                        .next()
+                        .and_then(|line| line.split_whitespace().nth(1))
+                        .unwrap_or("/");
+                    let (status, reason, body) = if path.starts_with("/tottus-pe/search") {
+                        (200, "OK", listing_body)
+                    } else if path.contains("/2002") {
+                        (200, "OK", good_pdp)
+                    } else {
+                        (404, "Not Found", "not found".to_string())
+                    };
+                    let resp = format!(
+                        "HTTP/1.1 {status} {reason}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = socket.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+
+        let adapter = FalabellaListingAdapter::with_enrichment(
+            format!("http://{addr}"),
+            test_http(),
+            true,
+            Some(cache_path.clone()),
+        );
+        let ctx = FetchContext::for_run(Uuid::new_v4(), "PE", None);
+        let batch = adapter.fetch_page("leche", 0, 20, &ctx).await.unwrap();
+
+        assert_eq!(batch.products.len(), 2);
+        assert_eq!(batch.products[0].skus[0].ean, None);
+        assert_eq!(batch.products[0].skus[0].available_qty, Some(1));
+        assert_eq!(
+            batch.products[1].skus[0].ean.as_deref(),
+            Some("7751271034142")
+        );
+
+        let saved_cache = TottusPdpCache::load(&cache_path).unwrap();
+        assert!(saved_cache.get("2001").is_none());
+        assert!(saved_cache.get("2002").is_some_and(|e| e.pdp_checked));
     }
 }

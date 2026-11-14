@@ -12,6 +12,7 @@ pub struct SkuItem {
     pub list_price: Option<f64>,
     pub selling_price: Option<f64>,
     pub card_price: Option<f64>,
+    pub card_program: Option<String>,
     pub available_qty: Option<i64>,
 }
 
@@ -57,6 +58,7 @@ pub struct BronzeSkuRow {
     pub list_price: Option<f64>,
     pub selling_price: Option<f64>,
     pub card_price: Option<f64>,
+    pub card_program: Option<String>,
     pub available_qty: Option<i64>,
     pub currency: String,
     pub sales_channel: String,
@@ -75,6 +77,41 @@ pub fn normalize_opt_string(s: Option<&str>) -> Option<String> {
     s.map(str::trim)
         .filter(|trimmed| !trimmed.is_empty())
         .map(str::to_string)
+}
+
+/// Validates a GS1 barcode candidate (GTIN-8, UPC-12, EAN-13, or GTIN-14)
+/// using ASCII digit checks, non-zero check, and GS1 Mod-10 checksum verification.
+pub fn validate_gtin_mod10(candidate: &str) -> Option<String> {
+    let trimmed = candidate.trim();
+    if !matches!(trimmed.len(), 8 | 12 | 13 | 14) {
+        return None;
+    }
+    let bytes = trimmed.as_bytes();
+    if !bytes.iter().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    if bytes.iter().all(|&b| b == b'0') {
+        return None;
+    }
+
+    let check = (bytes[bytes.len() - 1] - b'0') as u32;
+    let sum: u32 = bytes[..bytes.len() - 1]
+        .iter()
+        .rev()
+        .enumerate()
+        .map(|(idx, &b)| {
+            let digit = (b - b'0') as u32;
+            let weight = if idx % 2 == 0 { 3 } else { 1 };
+            digit * weight
+        })
+        .sum();
+    let expected = (10 - (sum % 10)) % 10;
+
+    if expected == check {
+        Some(trimmed.to_string())
+    } else {
+        None
+    }
 }
 
 impl Product {
@@ -120,6 +157,7 @@ impl Product {
                     list_price: sku.list_price,
                     selling_price: sku.selling_price,
                     card_price: sku.card_price,
+                    card_program: normalize_opt_string(sku.card_program.as_deref()),
                     available_qty: sku.available_qty,
                     currency: self.currency.clone(),
                     sales_channel: self.sales_channel.clone(),
@@ -181,6 +219,43 @@ mod tests {
     }
 
     #[test]
+    fn validate_gtin_mod10_accepts_valid_codes_and_rejects_invalid() {
+        // Valid GTIN-8, UPC-12, EAN-13, GTIN-14
+        assert_eq!(
+            validate_gtin_mod10(" 20181512 "),
+            Some("20181512".to_string())
+        );
+        assert_eq!(
+            validate_gtin_mod10("20570316"),
+            Some("20570316".to_string())
+        );
+        assert_eq!(
+            validate_gtin_mod10("012345678905"),
+            Some("012345678905".to_string())
+        );
+        assert_eq!(
+            validate_gtin_mod10("7751271034142"),
+            Some("7751271034142".to_string())
+        );
+        assert_eq!(
+            validate_gtin_mod10("17750151008669"),
+            Some("17750151008669".to_string())
+        );
+
+        // Invalid lengths, non-numeric, all-zeros, bad checksum
+        assert_eq!(validate_gtin_mod10(""), None);
+        assert_eq!(validate_gtin_mod10("null"), None);
+        assert_eq!(validate_gtin_mod10("926320"), None);
+        assert_eq!(validate_gtin_mod10("151258566"), None);
+        assert_eq!(validate_gtin_mod10("2026041409335179"), None);
+        assert_eq!(validate_gtin_mod10("00000000"), None);
+        assert_eq!(validate_gtin_mod10("0000000000000"), None);
+        assert_eq!(validate_gtin_mod10("20181521"), None);
+        assert_eq!(validate_gtin_mod10("7751271034143"), None);
+        assert_eq!(validate_gtin_mod10("VTCPERU-17045"), None);
+    }
+
+    #[test]
     fn product_to_bronze_rows_expands_one_to_many_and_preserves_payload_when_new() {
         let product = sample_product(vec![
             SkuItem {
@@ -192,6 +267,7 @@ mod tests {
                 list_price: Some(4.50),
                 selling_price: Some(4.20),
                 card_price: Some(3.99),
+                card_program: Some("  Oh!  ".to_string()),
                 available_qty: Some(50),
             },
             SkuItem {
@@ -203,6 +279,7 @@ mod tests {
                 list_price: Some(25.0),
                 selling_price: Some(23.9),
                 card_price: None,
+                card_program: Some("   ".to_string()),
                 available_qty: Some(12),
             },
         ]);
@@ -213,6 +290,7 @@ mod tests {
         assert_eq!(rows[0].sku_id, "sku-1");
         assert_eq!(rows[0].product_id, "prod-100");
         assert_eq!(rows[0].ean, Some("7750243012345".to_string()));
+        assert_eq!(rows[0].card_program.as_deref(), Some("Oh!"));
         assert_eq!(rows[0].payload_hash, "abc123def456");
         assert!(!rows[0].is_duplicate_payload);
         assert_eq!(
@@ -228,6 +306,7 @@ mod tests {
         assert_eq!(rows[1].product_id, "prod-100");
         assert_eq!(rows[1].ean, None);
         assert_eq!(rows[1].card_price, None);
+        assert_eq!(rows[1].card_program, None);
         assert!(!rows[1].is_duplicate_payload);
         assert_eq!(
             rows[1].raw_payload,
@@ -246,6 +325,7 @@ mod tests {
             list_price: Some(4.50),
             selling_price: Some(4.20),
             card_price: None,
+            card_program: None,
             available_qty: Some(10),
         }]);
 

@@ -1,9 +1,9 @@
 # Arquitectura Fase E1 — Ingesta, Capa Bronze y Benchmark (`retail-intel-pe`)
 
 **Rol BMAD:** Architect  
-**Versión:** `0.1.0`  
+**Versión:** `0.1.5`  
 **Fecha:** 2026-11-13  
-**Alcance:** Fase E1 exclusivamente (Ingesta multi-retailer en Rust, persistencia Bronze inmutable en Parquet ZSTD con deduplicación por `payload_hash`, DDL inicial PostgreSQL y auditoría DuckDB). Quedan fuera de E1 las reglas completas de normalización Silver (E2) y embeddings/matching (E3).
+**Alcance:** Fase E1 + Hardening E1.5 exclusivamente (Ingesta multi-retailer en Rust para Plaza Vea, Metro, Wong y Tottus; persistencia Bronze inmutable en Parquet ZSTD de 29 columnas con deduplicación por `payload_hash`, validación GS1 Mod-10 para fallbacks EAN, enriquecimiento selectivo/cacheado de PDPs Tottus en `state/tottus_ean_cache.json`, DDL inicial PostgreSQL y auditoría DuckDB). Quedan fuera de E1 las reglas completas de normalización Silver (E2) y embeddings/matching (E3).
 
 ---
 
@@ -20,8 +20,9 @@
 
 ```text
 +-----------------------+      +---------------------------+
-| VTEX API (PV, Metro,  |      | Falabella Listing (Tottus)|
-| Wong) _from/_to JSON  |      | __NEXT_DATA__ / BFF JSON  |
+| VTEX API (PV, Metro,  |      | Falabella Listing + PDP   |
+| Wong) _from/_to JSON  |      | (Tottus) __NEXT_DATA__ /  |
+| + fallback EAN Mod-10 |      | JSON-LD + ean cache       |
 +-----------+-----------+      +-------------+-------------+
             |                                |
             v                                v
@@ -29,30 +30,33 @@
    | rust-ingestor (tokio + reqwest + governor <=2r/s)|
    |  - Trait RetailerAdapter (Product 1:N SkuItem)   |
    |  - Exponential Backoff (max_retries=3)           |
-   |  - CheckpointStore (JSON resume por categoría)   |
+   |  - CheckpointStore (JSON resume + page_size)     |
    |  - PayloadDeduplicator (SHA-256 seen_hashes)     |
+   |  - TottusPdpCache (state/tottus_ean_cache.json)  |
    +------------------------+-------------------------+
                             |
             +---------------+---------------+
             v                               v
 +-----------+--------------+    +-----------+--------------+
 | Parquet Bronze (ZSTD-3)  |    | Run Metrics & Logs       |
-| data/bronze/dt=YYYY-MM-DD|    | metrics-<run_id>.json    |
-| /retailer=<name>/        |    | tracing JSON/structured  |
-| part-<run_id>.parquet    |    | peak_ram_mb (/proc/self) |
+| 29 cols (+ card_program) |    | metrics-<run_id>.json    |
+| data/bronze/dt=YYYY-MM-DD|    | tracing JSON/structured  |
+| /retailer=<name>/        |    | peak_ram_mb (/proc/self) |
+| part-<run_id>.parquet    |    | wire/content bytes       |
 +-----------+--------------+    +--------------------------+
             |
             v
 +-----------+--------------+    +--------------------------+
 | scripts/inspect_bronze.py|    | sql/postgres_schema.sql  |
 | DuckDB SQL Audit         |    | extraction_runs +        |
-| (SKU/Prod, EAN, Dups, S/)|    | 5 tablas catálogo maestro|
+| (SKU/Prod, EAN Mod-10,   |    | 5 tablas catálogo maestro|
+|  1:N Fanout, Card Prog.) |    | (sin índice redundante)  |
 +--------------------------+    +--------------------------+
 ```
 
 ---
 
-## 3. Esquema Bronze Parquet (`BronzeSkuRow`)
+## 3. Esquema Bronze Parquet (`BronzeSkuRow`, 29 columnas)
 
 Compresión: `ZSTD(level=3)`. Particionado físico Hive-style: `data/bronze/dt=YYYY-MM-DD/retailer=<name>/part-<run_id>.parquet`.
 
@@ -63,7 +67,7 @@ Compresión: `ZSTD(level=3)`. Particionado físico Hive-style: `data/bronze/dt=Y
 | `store_id` | `Utf8` | Sí | Tienda o zona resuelta |
 | `sku_id` | `Utf8` | No | Identificador único de SKU en el retailer |
 | `product_id` | `Utf8` | No | Identificador de producto padre (1:N) |
-| `ean` | `Utf8` | Sí | Código EAN/GTIN reportado (vacíos normalizados a `null`) |
+| `ean` | `Utf8` | Sí | Código EAN/GTIN reportado o resuelto por fallback Mod-10 / caché PDP (vacíos normalizados a `null`) |
 | `seller_id` | `Utf8` | Sí | Seller marketplace o tienda propia |
 | `raw_name` | `Utf8` | No | Nombre comercial del SKU/producto |
 | `brand` | `Utf8` | Sí | Marca reportada |
@@ -73,8 +77,9 @@ Compresión: `ZSTD(level=3)`. Particionado físico Hive-style: `data/bronze/dt=Y
 | `image_url` | `Utf8` | Sí | URL principal de imagen |
 | `list_price` | `Float64` | Sí | Precio lista / regular |
 | `selling_price` | `Float64` | Sí | Precio de venta online |
-| `card_price` | `Float64` | Sí | Precio tarjeta/membresía (CMR, Oh!, Cencosud, Teaser) |
-| `available_qty` | `Int64` | Sí | Stock disponible reportado |
+| `card_price` | `Float64` | Sí | Precio tarjeta/membresía (`CMR`, `Oh!`, `Cencosud`, `Wong Prime`) |
+| `card_program` | `Utf8` | Sí | Programa/tarjeta que otorga `card_price` (`Oh!`, `Cencosud`, `Wong Prime`, `CMR`) |
+| `available_qty` | `Int64` | Sí | Stock disponible reportado (o límite `maxOnCartAmount` / indicador `InStock`/`OutOfStock` en Tottus) |
 | `currency` | `Utf8` | No | Moneda (`PEN`) |
 | `sales_channel` | `Utf8` | No | Canal de venta (`ecommerce`) |
 | `postal_code` | `Utf8` | Sí | Código postal/ubigeo de consulta |
@@ -89,12 +94,14 @@ Compresión: `ZSTD(level=3)`. Particionado físico Hive-style: `data/bronze/dt=Y
 
 ---
 
-## 4. Contratos de Adaptadores y Resiliencia
+## 4. Contratos de Adaptadores, Caché y Resiliencia
 
-- **Rate Limiting:** `governor::RateLimiter` configurado a máximo **2 req/s** por instancia/dominio de adaptador.
+- **Rate Limiting:** `governor::RateLimiter` configurado a máximo **2 req/s** por instancia/dominio de adaptador (incluye consultas selectivas a PDPs de Tottus).
 - **Retry / Backoff:** Hasta 3 reintentos con backoff exponencial (`500ms * 2^attempt`) para HTTP `429`, `5xx` o errores transitorios de red.
-- **Checkpoints:** Persistidos en `data/bronze/checkpoints/<retailer>_<category_slug>.json` tras cada página exitosa, permitiendo `--resume` idempotente sin repetir páginas ya completadas.
-- **Métricas Emitidas:** `products_recovered`, `skus_recovered`, `pages_fetched`, `duplicates_detected`, `requests_ok`, `requests_error`, `avg_latency_ms`, `mb_transferred`, `total_duration_secs`, `peak_ram_mb`.
+- **Validación GS1 Mod-10 (`validate_gtin_mod10`):** Todo fallback de `ean` (`items[].referenceId`, `productReference`, `productReferenceCode`, especificaciones VTEX, JSON-LD `gtin13` en Tottus) se acepta únicamente si tiene 8, 12, 13 o 14 dígitos numéricos, no es todo-ceros y supera el checksum GS1 Mod-10.
+- **Enriquecimiento Selectivo Tottus + Caché (`state/tottus_ean_cache.json`):** Activado vía `--enrich-tottus-pdp --tottus-ean-cache <path>`, consulta la PDP únicamente para SKUs sin entrada previa en caché, extrayendo disponibilidad (`InStock`/`maxOnCartAmount`) y GTIN-13 Mod-10 si está disponible, sin sobrescribir jamás un EAN válido previo cuando el PDP retorne `"gtin13": "null"`.
+- **Checkpoints y Colisiones:** Persistidos en `data/bronze/checkpoints/<retailer>_<category_slug>.json` tras finalizar Parquet, incluyendo `page_size` para reanudación consistente y desambiguación automática con sufijo hash ante colisión de slug.
+- **Métricas Emitidas:** `products_recovered`, `skus_recovered`, `pages_fetched`, `duplicates_detected`, `requests_ok`, `requests_error`, `avg_latency_ms`, `mb_transferred` (`Content-Length` en red cuando existe o longitud de bytes recibidos), `total_duration_secs`, `peak_ram_mb`.
 
 ---
 

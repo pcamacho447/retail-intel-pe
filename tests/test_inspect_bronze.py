@@ -13,7 +13,7 @@ ROOT_DIR = Path(__file__).resolve().parent.parent
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-from scripts.inspect_bronze import audit_bronze, main  # noqa: E402
+from scripts.inspect_bronze import audit_bronze, format_markdown_report, main  # noqa: E402
 
 BRONZE_ARROW_SCHEMA = pa.schema(
     [
@@ -33,6 +33,7 @@ BRONZE_ARROW_SCHEMA = pa.schema(
         pa.field("list_price", pa.float64(), nullable=True),
         pa.field("selling_price", pa.float64(), nullable=True),
         pa.field("card_price", pa.float64(), nullable=True),
+        pa.field("card_program", pa.string(), nullable=True),
         pa.field("available_qty", pa.int64(), nullable=True),
         pa.field("currency", pa.string(), nullable=False),
         pa.field("sales_channel", pa.string(), nullable=False),
@@ -63,6 +64,8 @@ def _make_row(
     is_duplicate_payload: bool,
     raw_payload: str | None,
     run_id: str,
+    card_program: str | None = None,
+    raw_name: str | None = None,
 ) -> dict:
     return {
         "retailer": retailer,
@@ -72,7 +75,7 @@ def _make_row(
         "product_id": product_id,
         "ean": ean,
         "seller_id": "1",
-        "raw_name": f"Producto {sku_id}",
+        "raw_name": raw_name if raw_name is not None else f"Producto {sku_id}",
         "brand": "Gloria",
         "category_path": "Lácteos/Leches",
         "raw_description": "Descripción de prueba",
@@ -81,6 +84,7 @@ def _make_row(
         "list_price": list_price,
         "selling_price": selling_price,
         "card_price": card_price,
+        "card_program": card_program,
         "available_qty": available_qty,
         "currency": "PEN",
         "sales_channel": "ecommerce",
@@ -528,3 +532,493 @@ def test_zero_row_parquet_and_pa_null_card_price(tmp_path: Path) -> None:
     assert report["by_retailer"]["tottus"]["prices"]["card_price"]["min"] is None
     assert report["by_retailer"]["plazavea"]["prices"]["card_price"]["min"] == pytest.approx(11.0)
 
+
+def test_ean_mod10_validation_filters_invalid_and_garbage_eans(tmp_path: Path) -> None:
+    rows = [
+        # Valid GTIN-8, UPC-12, EAN-13, GTIN-14
+        _make_row(
+            retailer="tottus",
+            sku_id="s1",
+            product_id="p1",
+            ean=" 20181512 ",
+            list_price=10.0,
+            selling_price=9.0,
+            card_price=None,
+            available_qty=5,
+            payload_hash="h1",
+            is_duplicate_payload=False,
+            raw_payload="{}",
+            run_id="r1",
+        ),
+        _make_row(
+            retailer="tottus",
+            sku_id="s2",
+            product_id="p2",
+            ean="012345678905",
+            list_price=10.0,
+            selling_price=9.0,
+            card_price=None,
+            available_qty=5,
+            payload_hash="h2",
+            is_duplicate_payload=False,
+            raw_payload="{}",
+            run_id="r1",
+        ),
+        _make_row(
+            retailer="tottus",
+            sku_id="s3",
+            product_id="p3",
+            ean="7751271034142",
+            list_price=10.0,
+            selling_price=9.0,
+            card_price=None,
+            available_qty=5,
+            payload_hash="h3",
+            is_duplicate_payload=False,
+            raw_payload="{}",
+            run_id="r1",
+        ),
+        _make_row(
+            retailer="tottus",
+            sku_id="s4",
+            product_id="p4",
+            ean="17750151008669",
+            list_price=10.0,
+            selling_price=9.0,
+            card_price=None,
+            available_qty=5,
+            payload_hash="h4",
+            is_duplicate_payload=False,
+            raw_payload="{}",
+            run_id="r1",
+        ),
+        # Invalid lengths, bad Mod-10 checksums, all-zeros, literal "null", whitespace
+        _make_row(
+            retailer="tottus",
+            sku_id="s5",
+            product_id="p5",
+            ean="151258566",
+            list_price=10.0,
+            selling_price=9.0,
+            card_price=None,
+            available_qty=5,
+            payload_hash="h5",
+            is_duplicate_payload=False,
+            raw_payload="{}",
+            run_id="r1",
+        ),
+        _make_row(
+            retailer="tottus",
+            sku_id="s6",
+            product_id="p6",
+            ean="20181521",
+            list_price=10.0,
+            selling_price=9.0,
+            card_price=None,
+            available_qty=5,
+            payload_hash="h6",
+            is_duplicate_payload=False,
+            raw_payload="{}",
+            run_id="r1",
+        ),
+        _make_row(
+            retailer="tottus",
+            sku_id="s7",
+            product_id="p7",
+            ean="null",
+            list_price=10.0,
+            selling_price=9.0,
+            card_price=None,
+            available_qty=5,
+            payload_hash="h7",
+            is_duplicate_payload=False,
+            raw_payload="{}",
+            run_id="r1",
+        ),
+        _make_row(
+            retailer="tottus",
+            sku_id="s8",
+            product_id="p8",
+            ean="00000000",
+            list_price=10.0,
+            selling_price=9.0,
+            card_price=None,
+            available_qty=5,
+            payload_hash="h8",
+            is_duplicate_payload=False,
+            raw_payload="{}",
+            run_id="r1",
+        ),
+        _make_row(
+            retailer="tottus",
+            sku_id="s9",
+            product_id="p9",
+            ean="7751271034143",
+            list_price=10.0,
+            selling_price=9.0,
+            card_price=None,
+            available_qty=5,
+            payload_hash="h9",
+            is_duplicate_payload=False,
+            raw_payload="{}",
+            run_id="r1",
+        ),
+        _make_row(
+            retailer="tottus",
+            sku_id="s10",
+            product_id="p10",
+            ean=None,
+            list_price=10.0,
+            selling_price=9.0,
+            card_price=None,
+            available_qty=5,
+            payload_hash="h10",
+            is_duplicate_payload=False,
+            raw_payload="{}",
+            run_id="r1",
+        ),
+    ]
+    _write_bronze_partition(
+        tmp_path,
+        dt="2026-11-13",
+        retailer="tottus",
+        filename="part-r1.parquet",
+        rows=rows,
+    )
+
+    report = audit_bronze(tmp_path)
+    tottus = report["by_retailer"]["tottus"]
+    assert tottus["ean_non_null_count"] == 9
+    assert tottus["ean_coverage_pct"] == pytest.approx(90.0)
+    assert tottus["ean_mod10_valid_count"] == 4
+    assert tottus["ean_mod10_valid_pct"] == pytest.approx(40.0)
+    assert report["total"]["ean_mod10_valid_count"] == 4
+    assert report["total"]["ean_mod10_valid_pct"] == pytest.approx(40.0)
+
+
+def test_multi_sku_fanout_separates_1_to_n_from_duplicate_flags(tmp_path: Path) -> None:
+    rows = [
+        # 1 product expanded to 3 distinct SKUs (none are duplicate payloads)
+        _make_row(
+            retailer="metro",
+            sku_id="sku-1",
+            product_id="prod-a",
+            ean="7751271034142",
+            list_price=15.0,
+            selling_price=12.0,
+            card_price=None,
+            available_qty=5,
+            payload_hash="hash-a",
+            is_duplicate_payload=False,
+            raw_payload="{}",
+            run_id="r1",
+        ),
+        _make_row(
+            retailer="metro",
+            sku_id="sku-2",
+            product_id="prod-a",
+            ean="20181512",
+            list_price=16.0,
+            selling_price=13.0,
+            card_price=None,
+            available_qty=5,
+            payload_hash="hash-a",
+            is_duplicate_payload=False,
+            raw_payload="{}",
+            run_id="r1",
+        ),
+        _make_row(
+            retailer="metro",
+            sku_id="sku-3",
+            product_id="prod-a",
+            ean="012345678905",
+            list_price=17.0,
+            selling_price=14.0,
+            card_price=None,
+            available_qty=5,
+            payload_hash="hash-a",
+            is_duplicate_payload=False,
+            raw_payload="{}",
+            run_id="r1",
+        ),
+        # 1 product flagged as true duplicate payload
+        _make_row(
+            retailer="metro",
+            sku_id="sku-4",
+            product_id="prod-b",
+            ean=None,
+            list_price=20.0,
+            selling_price=18.0,
+            card_price=None,
+            available_qty=2,
+            payload_hash="hash-b",
+            is_duplicate_payload=True,
+            raw_payload=None,
+            run_id="r1",
+        ),
+    ]
+    _write_bronze_partition(
+        tmp_path,
+        dt="2026-11-13",
+        retailer="metro",
+        filename="part-r1.parquet",
+        rows=rows,
+    )
+
+    report = audit_bronze(tmp_path)
+    metro = report["by_retailer"]["metro"]
+    assert metro["row_count"] == 4
+    assert metro["unique_products"] == 2
+    assert metro["unique_skus"] == 4
+    assert metro["duplicate_flag_count"] == 1
+    assert metro["duplicate_flag_pct"] == pytest.approx(25.0)
+    assert metro["multi_sku_fanout_count"] == 2
+    assert metro["multi_sku_fanout_pct"] == pytest.approx(50.0)
+    assert report["total"]["multi_sku_fanout_count"] == 2
+    assert report["total"]["multi_sku_fanout_pct"] == pytest.approx(50.0)
+
+    md = format_markdown_report(report)
+    assert "EAN Mod-10 (%)" in md
+    assert "1:N Fanout (%)" in md
+
+
+def test_card_program_counts_sample_products_and_markdown_sections(tmp_path: Path) -> None:
+    pv_rows = [
+        _make_row(
+            retailer="plazavea",
+            sku_id="pv-1",
+            product_id="pv-p1",
+            ean="7751271034142",
+            list_price=12.0,
+            selling_price=10.5,
+            card_price=9.0,
+            card_program="Oh!",
+            raw_name="Leche Gloria 390g",
+            available_qty=10,
+            payload_hash="hp1",
+            is_duplicate_payload=False,
+            raw_payload="{}",
+            run_id="r1",
+        ),
+        _make_row(
+            retailer="plazavea",
+            sku_id="pv-2",
+            product_id="pv-p2",
+            ean="151258566",  # invalid EAN
+            list_price=15.0,
+            selling_price=14.0,
+            card_price=12.0,
+            card_program="Oh!",
+            raw_name="Aceite Primor 1L",
+            available_qty=4,
+            payload_hash="hp2",
+            is_duplicate_payload=False,
+            raw_payload="{}",
+            run_id="r1",
+        ),
+        _make_row(
+            retailer="plazavea",
+            sku_id="pv-3",
+            product_id="pv-p3",
+            ean="20181512",
+            list_price=8.0,
+            selling_price=7.5,
+            card_price=None,
+            card_program="Oh!",  # card_price is None -> must NOT count!
+            raw_name="Arroz Costeño 750g",
+            available_qty=8,
+            payload_hash="hp3",
+            is_duplicate_payload=False,
+            raw_payload="{}",
+            run_id="r1",
+        ),
+    ]
+    metro_rows = [
+        _make_row(
+            retailer="metro",
+            sku_id="mt-1",
+            product_id="mt-p1",
+            ean="012345678905",
+            list_price=22.0,
+            selling_price=19.9,
+            card_price=17.9,
+            card_program="Cencosud",
+            raw_name="Café Altomayo",
+            available_qty=3,
+            payload_hash="hm1",
+            is_duplicate_payload=False,
+            raw_payload="{}",
+            run_id="r2",
+        ),
+    ]
+    tottus_rows = [
+        _make_row(
+            retailer="tottus",
+            sku_id="tt-1",
+            product_id="tt-p1",
+            ean="17750151008669",
+            list_price=14.0,
+            selling_price=13.0,
+            card_price=11.5,
+            card_program="CMR",
+            raw_name="Avena Quaker 500g",
+            available_qty=7,
+            payload_hash="ht1",
+            is_duplicate_payload=False,
+            raw_payload="{}",
+            run_id="r3",
+        ),
+    ]
+
+    _write_bronze_partition(tmp_path, dt="2026-11-13", retailer="plazavea", filename="part-r1.parquet", rows=pv_rows)
+    _write_bronze_partition(tmp_path, dt="2026-11-13", retailer="metro", filename="part-r2.parquet", rows=metro_rows)
+    _write_bronze_partition(tmp_path, dt="2026-11-13", retailer="tottus", filename="part-r3.parquet", rows=tottus_rows)
+
+    report = audit_bronze(tmp_path)
+    assert report["by_retailer"]["plazavea"]["card_program_counts"] == {"Oh!": 2}
+    assert report["by_retailer"]["metro"]["card_program_counts"] == {"Cencosud": 1}
+    assert report["by_retailer"]["tottus"]["card_program_counts"] == {"CMR": 1}
+    assert report["total"]["card_program_counts"] == {"Oh!": 2, "Cencosud": 1, "CMR": 1}
+
+    samples = report["sample_products"]
+    assert 1 <= len(samples) <= 16
+    assert len(samples) == 5
+    required_keys = {
+        "retailer",
+        "sku_id",
+        "raw_name",
+        "ean",
+        "list_price",
+        "selling_price",
+        "card_price",
+        "card_program",
+        "available_qty",
+    }
+    assert all(required_keys.issubset(item.keys()) for item in samples)
+    # Prioritizes SKUs with card_price IS NOT NULL and valid Mod-10 EAN before pv-3 (card_price=None)
+    assert samples[-1]["sku_id"] == "pv-3"
+
+    md = format_markdown_report(report)
+    assert "### Card Programs Breakdown" in md
+    assert "### Sample Multi-Retailer Observations" in md
+    assert "P. Tarjeta + Programa" in md
+    assert "9.00 (Oh!)" in md
+    assert "17.90 (Cencosud)" in md
+    assert "11.50 (CMR)" in md
+
+
+def test_legacy_28_column_parquet_and_empty_metrics_include_new_fields(tmp_path: Path) -> None:
+    empty_report = audit_bronze(tmp_path / "missing")
+    assert empty_report["sample_products"] == []
+    assert empty_report["total"]["ean_mod10_valid_count"] == 0
+    assert empty_report["total"]["ean_mod10_valid_pct"] == 0.0
+    assert empty_report["total"]["multi_sku_fanout_count"] == 0
+    assert empty_report["total"]["multi_sku_fanout_pct"] == 0.0
+    assert empty_report["total"]["card_program_counts"] == {}
+
+    legacy_dir = tmp_path / "legacy_28col"
+    part_dir = legacy_dir / "dt=2026-11-13" / "retailer=plazavea"
+    part_dir.mkdir(parents=True)
+    legacy_schema = pa.schema(
+        [field for field in BRONZE_ARROW_SCHEMA if field.name != "card_program"]
+    )
+    row = _make_row(
+        retailer="plazavea",
+        sku_id="leg-1",
+        product_id="leg-p1",
+        ean="7751271034142",
+        list_price=10.0,
+        selling_price=9.0,
+        card_price=8.0,
+        available_qty=1,
+        payload_hash="hl1",
+        is_duplicate_payload=False,
+        raw_payload="{}",
+        run_id="r-leg",
+    )
+    row.pop("card_program")
+    table = pa.Table.from_pylist([row], schema=legacy_schema)
+    assert table.num_columns == 28
+    pq.write_table(table, part_dir / "part-legacy.parquet", compression="zstd")
+
+    report = audit_bronze(legacy_dir)
+    assert report["total"]["row_count"] == 1
+    assert report["total"]["ean_mod10_valid_count"] == 1
+    assert report["total"]["card_program_counts"] == {}
+    assert report["sample_products"][0]["card_program"] is None
+    md = format_markdown_report(report)
+    assert "### Sample Multi-Retailer Observations" in md
+
+
+def test_schema_has_29_columns_and_samples_cap_at_16_across_mixed_schemas(tmp_path: Path) -> None:
+    assert len(BRONZE_ARROW_SCHEMA) == 29
+    field_names = BRONZE_ARROW_SCHEMA.names
+    assert field_names[field_names.index("card_price") + 1] == "card_program"
+
+    # Write 5 rows for each of 3 retailers using 29-column schema + 5 rows for 4th using 28-column schema
+    for retailer, program in [("plazavea", "Oh!"), ("metro", "Cencosud"), ("wong", "Wong Prime")]:
+        rows = [
+            _make_row(
+                retailer=retailer,
+                sku_id=f"{retailer}-{i}",
+                product_id=f"{retailer}-p-{i}",
+                ean="7751271034142",
+                list_price=10.0 + i,
+                selling_price=9.0 + i,
+                card_price=8.0 + i,
+                card_program=program,
+                available_qty=5,
+                payload_hash=f"h-{retailer}-{i}",
+                is_duplicate_payload=False,
+                raw_payload="{}",
+                run_id=f"run-{retailer}",
+            )
+            for i in range(5)
+        ]
+        _write_bronze_partition(
+            tmp_path,
+            dt="2026-11-14",
+            retailer=retailer,
+            filename=f"part-{retailer}.parquet",
+            rows=rows,
+        )
+
+    legacy_schema = pa.schema(
+        [field for field in BRONZE_ARROW_SCHEMA if field.name != "card_program"]
+    )
+    tottus_rows = []
+    for i in range(5):
+        r = _make_row(
+            retailer="tottus",
+            sku_id=f"tottus-{i}",
+            product_id=f"tottus-p-{i}",
+            ean="20181512",
+            list_price=12.0 + i,
+            selling_price=11.0 + i,
+            card_price=10.0 + i,
+            available_qty=3,
+            payload_hash=f"h-tottus-{i}",
+            is_duplicate_payload=False,
+            raw_payload="{}",
+            run_id="run-tottus",
+        )
+        r.pop("card_program")
+        tottus_rows.append(r)
+    tottus_dir = tmp_path / "dt=2026-11-14" / "retailer=tottus"
+    tottus_dir.mkdir(parents=True)
+    pq.write_table(
+        pa.Table.from_pylist(tottus_rows, schema=legacy_schema),
+        tottus_dir / "part-tottus.parquet",
+        compression="zstd",
+    )
+
+    report = audit_bronze(tmp_path)
+    assert report["total"]["row_count"] == 20
+    assert report["total"]["card_program_counts"] == {
+        "Cencosud": 5,
+        "Oh!": 5,
+        "Wong Prime": 5,
+    }
+    assert len(report["sample_products"]) == 16
+    sampled_retailers = {item["retailer"] for item in report["sample_products"]}
+    assert sampled_retailers == {"plazavea", "metro", "wong", "tottus"}

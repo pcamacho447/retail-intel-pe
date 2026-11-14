@@ -91,9 +91,14 @@ impl RateLimitedHttpClient {
                 Ok(resp) => {
                     let status = resp.status().as_u16();
                     if resp.status().is_success() {
-                        match resp.text().await {
-                            Ok(body) => {
-                                let bytes = body.len();
+                        let content_len = resp
+                            .content_length()
+                            .and_then(|n| usize::try_from(n).ok())
+                            .filter(|&n| n > 0);
+                        match resp.bytes().await {
+                            Ok(raw_bytes) => {
+                                let bytes = content_len.unwrap_or(raw_bytes.len());
+                                let body = String::from_utf8_lossy(&raw_bytes).into_owned();
                                 let latency_ms = req_start.elapsed().as_secs_f64() * 1000.0;
                                 self.requests_ok.fetch_add(1, Ordering::Relaxed);
                                 return Ok(HttpResponseData {
@@ -354,5 +359,66 @@ mod tests {
         let resp = client.get_text(&format!("{base_url}/vtex")).await.unwrap();
         assert_eq!(resp.status, 206);
         assert_eq!(resp.body, "[]");
+    }
+
+    #[tokio::test]
+    async fn http_client_reports_wire_content_length_and_chunked_fallback() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            for idx in 0..3 {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let mut buf = [0u8; 2048];
+                let _ = socket.read(&mut buf).await;
+                match idx {
+                    0 => {
+                        let header = b"HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=iso-8859-1\r\nContent-Length: 4\r\nConnection: close\r\n\r\n";
+                        let _ = socket.write_all(header).await;
+                        let _ = socket.write_all(b"caf\xe9").await;
+                    }
+                    1 => {
+                        let header = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n";
+                        let _ = socket.write_all(header).await;
+                        let _ = socket.write_all(b"4\r\nok\xff!\r\n0\r\n\r\n").await;
+                    }
+                    _ => {
+                        let raw = b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\nConnection: close\r\n\r\nhello world";
+                        let _ = socket.write_all(raw).await;
+                    }
+                }
+            }
+        });
+
+        let client = RateLimitedHttpClient::with_config(
+            NonZeroU32::new(50).unwrap(),
+            1,
+            5,
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        let base_url = format!("http://{addr}");
+
+        let cl_resp = client
+            .get_text(&format!("{base_url}/wire-len"))
+            .await
+            .unwrap();
+        assert_eq!(cl_resp.status, 200);
+        assert_eq!(cl_resp.bytes, 4);
+
+        let chunked_resp = client
+            .get_text(&format!("{base_url}/chunked"))
+            .await
+            .unwrap();
+        assert_eq!(chunked_resp.status, 200);
+        assert_eq!(chunked_resp.bytes, 4);
+        assert_eq!(chunked_resp.body, "ok\u{FFFD}!");
+
+        let ascii_resp = client.get_text(&format!("{base_url}/ascii")).await.unwrap();
+        assert_eq!(ascii_resp.status, 200);
+        assert_eq!(ascii_resp.bytes, 11);
+        assert_eq!(ascii_resp.body, "hello world");
     }
 }

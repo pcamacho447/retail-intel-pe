@@ -7,7 +7,7 @@ use serde_json::Value;
 use crate::adapter::{FetchContext, PageBatch, RetailerAdapter};
 use crate::adapters::{absolutize_url, encode_url_segment, value_as_string};
 use crate::dedup::compute_payload_hash;
-use crate::domain::{normalize_opt_string, Product, SkuItem};
+use crate::domain::{normalize_opt_string, validate_gtin_mod10, Product, SkuItem};
 use crate::http::RateLimitedHttpClient;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -61,128 +61,285 @@ impl VtexAdapter {
 
 fn positive_f64(val: Option<&Value>) -> Option<f64> {
     let num = val?.as_f64()?;
-    if num.is_finite() && num > 0.0 {
-        Some(num)
+    (num.is_finite() && num > 0.0).then_some(num)
+}
+
+fn parse_positive_param_f64(val: Option<&Value>) -> Option<f64> {
+    let v = val?;
+    if let Some(num) = positive_f64(Some(v)) {
+        return Some(num);
+    }
+    let num = v.as_str()?.trim().parse::<f64>().ok()?;
+    (num.is_finite() && num > 0.0).then_some(num)
+}
+
+/// Looks up a VTEX JSON field across PascalCase, camelCase, and C# `<Field>k__BackingField`
+/// auto-property keys frequently serialized inside `commertialOffer.Teasers`.
+fn vtex_field<'a>(obj: &'a Value, pascal: &str) -> Option<&'a Value> {
+    if let Some(val) = obj.get(pascal).filter(|v| !v.is_null()) {
+        return Some(val);
+    }
+    let mut chars = pascal.chars();
+    if let Some(first) = chars.next() {
+        let camel = format!("{}{}", first.to_ascii_lowercase(), chars.as_str());
+        if let Some(val) = obj.get(&camel).filter(|v| !v.is_null()) {
+            return Some(val);
+        }
+    }
+    let backing = format!("<{pascal}>k__BackingField");
+    obj.get(&backing).filter(|v| !v.is_null())
+}
+
+fn vtex_parameters(parent: Option<&Value>) -> &[Value] {
+    parent
+        .and_then(|p| vtex_field(p, "Parameters"))
+        .and_then(|v| v.as_array())
+        .map(Vec::as_slice)
+        .unwrap_or(&[])
+}
+
+fn vtex_param_kv(param: &Value) -> Option<(String, Option<&Value>)> {
+    let name = vtex_field(param, "Name")
+        .and_then(|v| v.as_str())
+        .and_then(|s| normalize_opt_string(Some(s)))?;
+    Some((name, vtex_field(param, "Value")))
+}
+
+fn split_param_tokens(val: &str) -> impl Iterator<Item = &str> {
+    val.split(|c: char| c == ',' || c == ';' || c.is_whitespace())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+}
+
+fn validate_value_gtin(val: Option<&Value>) -> Option<String> {
+    value_as_string(val).and_then(|s| validate_gtin_mod10(&s))
+}
+
+fn extract_vtex_ean(item: &Value, product_elem: &Value) -> Option<String> {
+    if let Some(ean) = normalize_opt_string(item.get("ean").and_then(|v| v.as_str())) {
+        return Some(ean);
+    }
+
+    // VTEX Plaza Vea often leaves items[].ean empty while storing a valid EAN-8 in
+    // referenceId[].Value alongside invalid internal IDs (e.g. 926320, 20181521)
+    // that GS1 Mod-10 rejects.
+    if let Some(refs) = item.get("referenceId").and_then(|v| v.as_array()) {
+        for entry in refs {
+            if let Some(gtin) = validate_value_gtin(vtex_field(entry, "Value")) {
+                return Some(gtin);
+            }
+        }
+    }
+
+    for key in ["productReference", "productReferenceCode"] {
+        if let Some(gtin) = validate_value_gtin(product_elem.get(key)) {
+            return Some(gtin);
+        }
+    }
+
+    const SPEC_EAN_KEYS: [&str; 8] = [
+        "EAN",
+        "ean",
+        "Código EAN",
+        "Codigo EAN",
+        "Código de barras",
+        "Codigo de barras",
+        "GTIN",
+        "gtin",
+    ];
+    for key in SPEC_EAN_KEYS {
+        let Some(val) = product_elem.get(key) else {
+            continue;
+        };
+        let candidates = val
+            .as_array()
+            .map(Vec::as_slice)
+            .unwrap_or(std::slice::from_ref(val));
+        for elem in candidates {
+            if let Some(gtin) = validate_value_gtin(Some(elem)) {
+                return Some(gtin);
+            }
+        }
+    }
+
+    None
+}
+
+fn teaser_targets_sku(params: &[Value], sku_id: &str) -> bool {
+    let target_ids = params.iter().find_map(|param| {
+        let (name, val) = vtex_param_kv(param)?;
+        if name.eq_ignore_ascii_case("PromotionalPriceTableItemsIds") {
+            value_as_string(val)
+        } else {
+            None
+        }
+    });
+    target_ids.is_none_or(|ids_val| split_param_tokens(&ids_val).any(|id| id == sku_id))
+}
+
+fn compute_param_card_price(
+    param_name: &str,
+    val: f64,
+    list_price: Option<f64>,
+    selling_price: Option<f64>,
+) -> Option<f64> {
+    let name = param_name.to_ascii_lowercase();
+    if name.contains("shipping") {
+        return None;
+    }
+
+    let candidate = if name == "promotionalpricetableitemsdiscount" {
+        // VTEX price-table discounts subtract from ListPrice rather than Price.
+        list_price
+            .or(selling_price)
+            .filter(|base| *base > val)
+            .map(|base| ((base - val) * 100.0).round() / 100.0)
+            .filter(|p| selling_price.is_none_or(|sp| *p < sp))
+    } else if name == "maximumunitpricediscount" {
+        // VTEX encodes MaximumUnitPriceDiscount in integer centavos (e.g. "41900" -> 419.00).
+        let price = val.round() / 100.0;
+        Some(price).filter(|p| selling_price.is_none_or(|sp| *p < sp))
+    } else if name.contains("percentualdiscount") {
+        selling_price
+            .filter(|_| val < 100.0)
+            .map(|sp| ((sp * (1.0 - val / 100.0)) * 100.0).round() / 100.0)
+    } else if name.contains("nominaldiscount") {
+        selling_price
+            .filter(|sp| *sp > val)
+            .map(|sp| ((sp - val) * 100.0).round() / 100.0)
+    } else if name == "promotionalprice" || name == "cardprice" {
+        Some(val)
     } else {
         None
+    };
+
+    candidate.filter(|p| p.is_finite() && *p > 0.0)
+}
+
+fn classify_from_condition_params(
+    params: &[Value],
+    retailer: VtexRetailer,
+) -> Option<&'static str> {
+    const CENCOSUD_BINS: [&str; 4] = ["905051", "477357", "489068", "512533"];
+    const OH_PAYMENT_METHODS: [&str; 3] = ["210", "208", "202"];
+
+    let mut has_oh_payment_method = false;
+    for param in params {
+        let Some((name, val)) = vtex_param_kv(param) else {
+            continue;
+        };
+        let Some(raw) = value_as_string(val) else {
+            continue;
+        };
+        if name.eq_ignore_ascii_case("RestrictionsBins")
+            && split_param_tokens(&raw)
+                .any(|tok| CENCOSUD_BINS.iter().any(|bin| tok.starts_with(bin)))
+        {
+            return Some("Cencosud");
+        }
+        if retailer == VtexRetailer::PlazaVea
+            && name.eq_ignore_ascii_case("PaymentMethodId")
+            && split_param_tokens(&raw).any(|tok| OH_PAYMENT_METHODS.contains(&tok))
+        {
+            has_oh_payment_method = true;
+        }
+    }
+
+    has_oh_payment_method.then_some("Oh!")
+}
+
+fn classify_card_program(teaser: &Value, retailer: VtexRetailer) -> String {
+    let teaser_name = vtex_field(teaser, "Name")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_lowercase();
+
+    if teaser_name.contains("prime") {
+        return "Wong Prime".to_string();
+    }
+    if teaser_name.contains("oh") {
+        return "Oh!".to_string();
+    }
+    if ["tcenco", "cencosud", "tc metro", "tc wong"]
+        .iter()
+        .any(|kw| teaser_name.contains(kw))
+    {
+        return "Cencosud".to_string();
+    }
+
+    let cond_params = vtex_parameters(vtex_field(teaser, "Conditions"));
+    if let Some(program) = classify_from_condition_params(cond_params, retailer) {
+        return program.to_string();
+    }
+
+    match retailer {
+        VtexRetailer::PlazaVea => "Oh!".to_string(),
+        VtexRetailer::Metro | VtexRetailer::Wong => "Cencosud".to_string(),
     }
 }
 
-fn extract_card_price(
+fn extract_card_offer(
     offer: &Value,
     sku_id: &str,
     list_price: Option<f64>,
     selling_price: Option<f64>,
-) -> Option<f64> {
-    let mut best: Option<f64> = None;
+    retailer: VtexRetailer,
+) -> (Option<f64>, Option<String>) {
+    let mut best: Option<(f64, String)> = None;
 
     for key in ["PromotionTeasers", "Teasers"] {
-        let Some(teasers) = offer.get(key).and_then(|v| v.as_array()) else {
+        let Some(teasers) = vtex_field(offer, key).and_then(|v| v.as_array()) else {
             continue;
         };
         for teaser in teasers {
-            let min_qty = teaser
-                .get("Conditions")
-                .or_else(|| teaser.get("conditions"))
-                .and_then(|c| {
-                    c.get("MinimumQuantity")
-                        .or_else(|| c.get("minimumQuantity"))
+            let conditions = vtex_field(teaser, "Conditions");
+            let min_qty = conditions
+                .and_then(|c| vtex_field(c, "MinimumQuantity"))
+                .and_then(|v| {
+                    v.as_u64()
+                        .or_else(|| v.as_str()?.trim().parse::<u64>().ok())
                 })
-                .and_then(|v| v.as_u64())
                 .unwrap_or(0);
             if min_qty > 1 {
                 continue;
             }
 
-            let params = teaser
-                .get("Effects")
-                .or_else(|| teaser.get("effects"))
-                .and_then(|e| e.get("Parameters").or_else(|| e.get("parameters")))
-                .and_then(|p| p.as_array());
-
-            let Some(params) = params else {
+            let params = vtex_parameters(vtex_field(teaser, "Effects"));
+            if params.is_empty() || !teaser_targets_sku(params, sku_id) {
                 continue;
-            };
-
-            let target_ids_param = params.iter().find(|param| {
-                param
-                    .get("Name")
-                    .or_else(|| param.get("name"))
-                    .and_then(|v| v.as_str())
-                    .is_some_and(|n| n.eq_ignore_ascii_case("PromotionalPriceTableItemsIds"))
-            });
-            if let Some(ids_val) = target_ids_param.and_then(|p| {
-                p.get("Value")
-                    .or_else(|| p.get("value"))
-                    .and_then(|v| v.as_str())
-            }) {
-                let targets_sku = ids_val
-                    .split(',')
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .any(|id| id == sku_id);
-                if !ids_val.trim().is_empty() && !targets_sku {
-                    continue;
-                }
             }
 
-            for param in params {
-                let name = param
-                    .get("Name")
-                    .or_else(|| param.get("name"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default()
-                    .to_ascii_lowercase();
-                if name.contains("shipping") {
-                    continue;
-                }
+            let teaser_best = params
+                .iter()
+                .filter_map(|param| {
+                    let (name, val) = vtex_param_kv(param)?;
+                    let num = parse_positive_param_f64(val)?;
+                    compute_param_card_price(&name, num, list_price, selling_price)
+                })
+                .reduce(f64::min);
 
-                let raw_val = param.get("Value").or_else(|| param.get("value"));
-                let parsed_num = raw_val.and_then(|v| {
-                    v.as_f64()
-                        .or_else(|| v.as_str()?.trim().parse::<f64>().ok())
-                });
-
-                let Some(val) = parsed_num.filter(|x| x.is_finite() && *x > 0.0) else {
-                    continue;
-                };
-
-                let candidate = if name == "promotionalpricetableitemsdiscount" {
-                    list_price
-                        .or(selling_price)
-                        .filter(|base| *base > val)
-                        .map(|base| ((base - val) * 100.0).round() / 100.0)
-                        .filter(|p| selling_price.is_none_or(|sp| *p < sp))
-                } else if name == "maximumunitpricediscount" {
-                    let price = val.round() / 100.0;
-                    Some(price).filter(|p| selling_price.is_none_or(|sp| *p < sp))
-                } else if name.contains("percentualdiscount") {
-                    selling_price
-                        .filter(|_| val < 100.0)
-                        .map(|sp| ((sp * (1.0 - val / 100.0)) * 100.0).round() / 100.0)
-                } else if name.contains("nominaldiscount") {
-                    selling_price
-                        .filter(|sp| *sp > val)
-                        .map(|sp| ((sp - val) * 100.0).round() / 100.0)
-                } else if name == "promotionalprice" || name == "cardprice" {
-                    Some(val)
-                } else {
-                    None
-                };
-
-                if let Some(price) = candidate.filter(|p| *p > 0.0) {
-                    best = Some(best.map_or(price, |curr| curr.min(price)));
+            if let Some(price) = teaser_best {
+                if best.as_ref().is_none_or(|(curr, _)| price < *curr) {
+                    best = Some((price, classify_card_program(teaser, retailer)));
                 }
             }
         }
     }
 
-    best
+    match best {
+        Some((price, program)) => (Some(price), Some(program)),
+        None => (None, None),
+    }
 }
 
-fn parse_vtex_sku(item: &Value, fallback_name: &str) -> Option<SkuItem> {
+fn parse_vtex_sku(
+    item: &Value,
+    product_elem: &Value,
+    fallback_name: &str,
+    retailer: VtexRetailer,
+) -> Option<SkuItem> {
     let sku_id = value_as_string(item.get("itemId"))?;
-    let ean = normalize_opt_string(item.get("ean").and_then(|v| v.as_str()));
+    let ean = extract_vtex_ean(item, product_elem);
     let raw_name = normalize_opt_string(item.get("nameComplete").and_then(|v| v.as_str()))
         .or_else(|| normalize_opt_string(item.get("name").and_then(|v| v.as_str())))
         .unwrap_or_else(|| fallback_name.to_string());
@@ -202,13 +359,14 @@ fn parse_vtex_sku(item: &Value, fallback_name: &str) -> Option<SkuItem> {
             .or_else(|| arr.first())
     });
 
-    let (seller_id, list_price, selling_price, card_price, available_qty) =
+    let (seller_id, list_price, selling_price, card_price, card_program, available_qty) =
         if let Some(seller) = selected_seller {
             let seller_id = value_as_string(seller.get("sellerId"));
             let offer = seller.get("commertialOffer").unwrap_or(&Value::Null);
             let list_price = positive_f64(offer.get("ListPrice"));
             let selling_price = positive_f64(offer.get("Price"));
-            let card_price = extract_card_price(offer, &sku_id, list_price, selling_price);
+            let (card_price, card_program) =
+                extract_card_offer(offer, &sku_id, list_price, selling_price, retailer);
             let available_qty = offer
                 .get("AvailableQuantity")
                 .and_then(|v| v.as_i64().or_else(|| v.as_f64().map(|f| f as i64)));
@@ -217,10 +375,11 @@ fn parse_vtex_sku(item: &Value, fallback_name: &str) -> Option<SkuItem> {
                 list_price,
                 selling_price,
                 card_price,
+                card_program,
                 available_qty,
             )
         } else {
-            (None, None, None, None, None)
+            (None, None, None, None, None, None)
         };
 
     Some(SkuItem {
@@ -232,6 +391,7 @@ fn parse_vtex_sku(item: &Value, fallback_name: &str) -> Option<SkuItem> {
         list_price,
         selling_price,
         card_price,
+        card_program,
         available_qty,
     })
 }
@@ -316,7 +476,7 @@ impl RetailerAdapter for VtexAdapter {
                 .and_then(|v| v.as_array())
                 .map(|arr| {
                     arr.iter()
-                        .filter_map(|sku| parse_vtex_sku(sku, &raw_name))
+                        .filter_map(|sku| parse_vtex_sku(sku, elem, &raw_name, self.retailer))
                         .collect()
                 })
                 .unwrap_or_default();
@@ -527,11 +687,13 @@ mod tests {
         assert_eq!(p1.skus[0].list_price, Some(5.00));
         assert_eq!(p1.skus[0].selling_price, Some(4.20));
         assert_eq!(p1.skus[0].card_price, Some(3.78));
+        assert_eq!(p1.skus[0].card_program.as_deref(), Some("Oh!"));
         assert_eq!(p1.skus[0].available_qty, Some(35));
 
         assert_eq!(p1.skus[1].sku_id, "1002");
         assert_eq!(p1.skus[1].ean, None);
         assert_eq!(p1.skus[1].card_price, None);
+        assert_eq!(p1.skus[1].card_program, None);
         assert_eq!(p1.skus[1].selling_price, Some(24.90));
 
         let p2 = &products[1];
@@ -540,6 +702,7 @@ mod tests {
         assert_eq!(p2.skus[0].seller_id, None);
         assert_eq!(p2.skus[0].list_price, None);
         assert_eq!(p2.skus[0].selling_price, None);
+        assert_eq!(p2.skus[0].card_program, None);
         assert_eq!(p2.skus[0].available_qty, None);
     }
 
@@ -615,7 +778,12 @@ mod tests {
         let ctx = FetchContext::for_run(Uuid::new_v4(), "PE", None);
         let products = adapter.parse_page_payload(fixture, &ctx).unwrap();
         assert_eq!(products[0].skus[0].card_price, Some(4.90));
+        assert_eq!(products[0].skus[0].card_program.as_deref(), Some("Oh!"));
         assert_eq!(products[1].skus[0].card_price, Some(1199.00));
+        assert_eq!(
+            products[1].skus[0].card_program.as_deref(),
+            Some("Cencosud")
+        );
     }
 
     #[test]
@@ -662,6 +830,7 @@ mod tests {
         let ctx = FetchContext::for_run(Uuid::new_v4(), "PE", None);
         let products = adapter.parse_page_payload(fixture, &ctx).unwrap();
         assert_eq!(products[0].skus[0].card_price, None);
+        assert_eq!(products[0].skus[0].card_program, None);
     }
 
     #[tokio::test]
@@ -729,5 +898,483 @@ mod tests {
         assert_eq!(batch.products.len(), 1);
         assert!(!batch.has_more);
         assert_eq!(batch.next_offset, 1);
+    }
+
+    #[test]
+    fn vtex_ean_fallback_extracts_valid_mod10_and_rejects_invalid_candidates() {
+        let fixture = r#"[
+          {
+            "productId": "p-ref-valid",
+            "productName": "Aceite Primor",
+            "productReference": "926320",
+            "Código EAN": ["7751271034142"],
+            "items": [
+              {
+                "itemId": "sku-ref-1",
+                "ean": "",
+                "name": "Aceite Primor 1L",
+                "referenceId": [
+                  {"Key": "RefId", "Value": "926320"},
+                  {"Key": "RefId2", "Value": "20181521"},
+                  {"Key": "RefId3", "Value": "VTCPERU-123"},
+                  {"Key": "EAN", "Value": "20181512"}
+                ],
+                "sellers": []
+              },
+              {
+                "itemId": "sku-ref-2",
+                "ean": null,
+                "name": "Aceite Primor 500ml",
+                "referenceId": [
+                  {"Key": "RefId", "value": 20570316}
+                ],
+                "sellers": []
+              }
+            ]
+          },
+          {
+            "productId": "p-spec-fallback",
+            "productName": "Arroz Costeño",
+            "productReference": "VTCPERU-123",
+            "productReferenceCode": "20181521",
+            "Código EAN": ["invalid-ean", "7751271034142"],
+            "items": [
+              {
+                "itemId": "sku-spec-1",
+                "ean": "   ",
+                "name": "Arroz Costeño 5kg",
+                "referenceId": [{"Key": "RefId", "Value": "926320"}],
+                "sellers": []
+              }
+            ]
+          },
+          {
+            "productId": "p-prodref-fallback",
+            "productName": "Azucar Rubia",
+            "productReference": "012345678905",
+            "productReferenceCode": "17750151008669",
+            "items": [
+              {
+                "itemId": "sku-prodref-1",
+                "ean": "",
+                "name": "Azucar Rubia 1kg",
+                "sellers": []
+              }
+            ]
+          },
+          {
+            "productId": "p-prodrefcode-and-str-spec",
+            "productName": "Fideos Don Vittorio",
+            "productReference": "926320",
+            "productReferenceCode": "17750151008669",
+            "items": [
+              {
+                "itemId": "sku-prodrefcode-1",
+                "ean": "",
+                "name": "Fideos 500g",
+                "sellers": []
+              }
+            ]
+          },
+          {
+            "productId": "p-gtin-str-spec",
+            "productName": "Galleta Soda",
+            "GTIN": "7751271034142",
+            "items": [
+              {
+                "itemId": "sku-gtin-1",
+                "ean": "",
+                "name": "Galleta Soda 6pk",
+                "sellers": []
+              }
+            ]
+          },
+          {
+            "productId": "p-all-invalid",
+            "productName": "Producto Interno Sin GTIN",
+            "productReference": "926320",
+            "productReferenceCode": "20181521",
+            "EAN": ["VTCPERU-123", "00000000"],
+            "items": [
+              {
+                "itemId": "sku-none-1",
+                "ean": "",
+                "name": "Sin GTIN",
+                "referenceId": [
+                  {"Key": "RefId", "Value": "926320"},
+                  {"Key": "RefId2", "Value": "20181521"},
+                  {"Key": "RefId3", "Value": "VTCPERU-123"}
+                ],
+                "sellers": []
+              }
+            ]
+          }
+        ]"#;
+
+        let adapter = VtexAdapter::new(VtexRetailer::PlazaVea, test_http());
+        let ctx = FetchContext::for_run(Uuid::new_v4(), "PE", None);
+        let products = adapter.parse_page_payload(fixture, &ctx).unwrap();
+
+        assert_eq!(products[0].skus[0].ean.as_deref(), Some("20181512"));
+        assert_eq!(products[0].skus[1].ean.as_deref(), Some("20570316"));
+        assert_eq!(products[1].skus[0].ean.as_deref(), Some("7751271034142"));
+        assert_eq!(products[2].skus[0].ean.as_deref(), Some("012345678905"));
+        assert_eq!(products[3].skus[0].ean.as_deref(), Some("17750151008669"));
+        assert_eq!(products[4].skus[0].ean.as_deref(), Some("7751271034142"));
+        assert_eq!(products[5].skus[0].ean, None);
+    }
+
+    #[test]
+    fn vtex_plazavea_tarjeta_oh_sets_card_price_and_oh_program() {
+        let fixture = r#"[
+          {
+            "productId": "100470717",
+            "productName": "Filete de Atun CAMPOMAR 150g",
+            "items": [
+              {
+                "itemId": "10672464",
+                "name": "Filete de Atun",
+                "sellers": [{
+                  "sellerId": "1",
+                  "commertialOffer": {
+                    "ListPrice": 5.90,
+                    "Price": 5.20,
+                    "AvailableQuantity": 10,
+                    "PromotionTeasers": [{
+                      "Name": "TARJETA OH - PVEA",
+                      "Conditions": {
+                        "MinimumQuantity": 0,
+                        "Parameters": [{"Name": "PaymentMethodId", "Value": "210"}]
+                      },
+                      "Effects": {
+                        "Parameters": [
+                          {"Name": "PromotionalPriceTableItemsIds", "Value": "10672464"},
+                          {"Name": "PromotionalPriceTableItemsDiscount", "Value": "1.00"}
+                        ]
+                      }
+                    }]
+                  }
+                }]
+              },
+              {
+                "itemId": "10672465",
+                "name": "Filete sin promo tarjeta",
+                "sellers": [{
+                  "sellerId": "1",
+                  "commertialOffer": {
+                    "ListPrice": 5.90,
+                    "Price": 5.20,
+                    "AvailableQuantity": 10,
+                    "PromotionTeasers": []
+                  }
+                }]
+              }
+            ]
+          }
+        ]"#;
+
+        let adapter = VtexAdapter::new(VtexRetailer::PlazaVea, test_http());
+        let ctx = FetchContext::for_run(Uuid::new_v4(), "PE", None);
+        let products = adapter.parse_page_payload(fixture, &ctx).unwrap();
+
+        assert_eq!(products[0].skus[0].card_price, Some(4.90));
+        assert_eq!(products[0].skus[0].card_program.as_deref(), Some("Oh!"));
+        assert_eq!(products[0].skus[1].card_price, None);
+        assert_eq!(products[0].skus[1].card_program, None);
+    }
+
+    #[test]
+    fn vtex_parses_csharp_backing_fields_in_teasers_when_promotion_teasers_empty() {
+        let fixture = r#"[
+          {
+            "productId": "3001",
+            "productName": "Cafe Instantaneo",
+            "items": [
+              {
+                "itemId": "30011",
+                "name": "Cafe 200g",
+                "sellers": [{
+                  "sellerId": "1",
+                  "commertialOffer": {
+                    "ListPrice": 25.00,
+                    "Price": 20.00,
+                    "AvailableQuantity": 8,
+                    "PromotionTeasers": [],
+                    "Teasers": [
+                      {
+                        "<Name>k__BackingField": "Promo Banco",
+                        "<Conditions>k__BackingField": {
+                          "<MinimumQuantity>k__BackingField": 1,
+                          "<Parameters>k__BackingField": [
+                            {"<Name>k__BackingField": "RestrictionsBins", "<Value>k__BackingField": "905051,477357,489068,512533"}
+                          ]
+                        },
+                        "<Effects>k__BackingField": {
+                          "<Parameters>k__BackingField": [
+                            {"<Name>k__BackingField": "NominalDiscount", "<Value>k__BackingField": "3.00"}
+                          ]
+                        }
+                      }
+                    ]
+                  }
+                }]
+              },
+              {
+                "itemId": "30012",
+                "name": "Cafe 100g",
+                "sellers": [{
+                  "sellerId": "1",
+                  "commertialOffer": {
+                    "ListPrice": 15.00,
+                    "Price": 12.00,
+                    "AvailableQuantity": 4,
+                    "PromotionTeasers": [],
+                    "Teasers": [
+                      {
+                        "<Name>k__BackingField": "Exclusivo App",
+                        "<Conditions>k__BackingField": {
+                          "<MinimumQuantity>k__BackingField": 0,
+                          "<Parameters>k__BackingField": [
+                            {"<Name>k__BackingField": "PaymentMethodId", "<Value>k__BackingField": "208,210"}
+                          ]
+                        },
+                        "<Effects>k__BackingField": {
+                          "<Parameters>k__BackingField": [
+                            {"<Name>k__BackingField": "CardPrice", "<Value>k__BackingField": "9.90"}
+                          ]
+                        }
+                      }
+                    ]
+                  }
+                }]
+              }
+            ]
+          }
+        ]"#;
+
+        let pv = VtexAdapter::new(VtexRetailer::PlazaVea, test_http());
+        let ctx = FetchContext::for_run(Uuid::new_v4(), "PE", None);
+        let products = pv.parse_page_payload(fixture, &ctx).unwrap();
+
+        assert_eq!(products[0].skus[0].card_price, Some(17.00));
+        assert_eq!(
+            products[0].skus[0].card_program.as_deref(),
+            Some("Cencosud")
+        );
+
+        assert_eq!(products[0].skus[1].card_price, Some(9.90));
+        assert_eq!(products[0].skus[1].card_program.as_deref(), Some("Oh!"));
+    }
+
+    #[test]
+    fn vtex_metro_tcenco_sets_cencosud_and_ignores_shipping_and_min_qty_gt_1() {
+        let fixture = r#"[
+          {
+            "productId": "4001",
+            "productName": "TV TCL 43",
+            "items": [{
+              "itemId": "40011",
+              "name": "TV TCL 43 FHD",
+              "sellers": [{
+                "sellerId": "1",
+                "commertialOffer": {
+                  "ListPrice": 899.00,
+                  "Price": 599.00,
+                  "AvailableQuantity": 6,
+                  "PromotionTeasers": [
+                    {
+                      "Name": "Envio Gratis Metro",
+                      "Conditions": {"MinimumQuantity": 0, "Parameters": []},
+                      "Effects": {
+                        "Parameters": [
+                          {"Name": "ShippingPercentualDiscount", "Value": "100"}
+                        ]
+                      }
+                    },
+                    {
+                      "Name": "Tag-p3x11.50",
+                      "Conditions": {"MinimumQuantity": 3, "Parameters": []},
+                      "Effects": {
+                        "Parameters": [
+                          {"Name": "MaximumUnitPriceDiscount", "Value": "1150"}
+                        ]
+                      }
+                    },
+                    {
+                      "Name": "[TCENCO] Nov26 - Tv - Tcl a 419 Con TC Metro",
+                      "Conditions": {"MinimumQuantity": 0, "Parameters": []},
+                      "Effects": {
+                        "Parameters": [
+                          {"Name": "MaximumUnitPriceDiscount", "Value": "41900"}
+                        ]
+                      }
+                    }
+                  ]
+                }
+              }]
+            }]
+          }
+        ]"#;
+
+        let adapter = VtexAdapter::new(VtexRetailer::Metro, test_http());
+        let ctx = FetchContext::for_run(Uuid::new_v4(), "PE", None);
+        let products = adapter.parse_page_payload(fixture, &ctx).unwrap();
+
+        assert_eq!(products[0].skus[0].card_price, Some(419.0));
+        assert_eq!(
+            products[0].skus[0].card_program.as_deref(),
+            Some("Cencosud")
+        );
+    }
+
+    #[test]
+    fn vtex_wong_classifies_tc_wong_cencosud_and_wong_prime_and_tracks_best_program() {
+        let fixture = r#"[
+          {
+            "productId": "5001",
+            "productName": "Vino Tinto Reserva",
+            "items": [{
+              "itemId": "50011",
+              "name": "Vino Tinto 750ml",
+              "sellers": [{
+                "sellerId": "1",
+                "commertialOffer": {
+                  "ListPrice": 60.00,
+                  "Price": 50.00,
+                  "AvailableQuantity": 12,
+                  "PromotionTeasers": [
+                    {
+                      "Name": "[TCENCO] Descuento Exclusivo Con TC Wong",
+                      "Conditions": {"MinimumQuantity": 1, "Parameters": []},
+                      "Effects": {
+                        "Parameters": [
+                          {"Name": "PercentualDiscount", "Value": "10.0"}
+                        ]
+                      }
+                    }
+                  ]
+                }
+              }]
+            }]
+          },
+          {
+            "productId": "5002",
+            "productName": "Queso Edam",
+            "items": [{
+              "itemId": "50021",
+              "name": "Queso Edam 250g",
+              "sellers": [{
+                "sellerId": "1",
+                "commertialOffer": {
+                  "ListPrice": 25.00,
+                  "Price": 20.00,
+                  "AvailableQuantity": 9,
+                  "PromotionTeasers": [
+                    {
+                      "Name": "[TCENCO] Con TC Wong 10%",
+                      "Effects": {
+                        "Parameters": [
+                          {"Name": "PercentualDiscount", "Value": "10.0"}
+                        ]
+                      }
+                    },
+                    {
+                      "Name": "Wong Prime 15%",
+                      "Effects": {
+                        "Parameters": [
+                          {"Name": "PercentualDiscount", "Value": "15.0"}
+                        ]
+                      }
+                    }
+                  ]
+                }
+              }]
+            }]
+          }
+        ]"#;
+
+        let adapter = VtexAdapter::new(VtexRetailer::Wong, test_http());
+        let ctx = FetchContext::for_run(Uuid::new_v4(), "PE", None);
+        let products = adapter.parse_page_payload(fixture, &ctx).unwrap();
+
+        assert_eq!(products[0].skus[0].card_price, Some(45.0));
+        assert_eq!(
+            products[0].skus[0].card_program.as_deref(),
+            Some("Cencosud")
+        );
+
+        assert_eq!(products[1].skus[0].card_price, Some(17.0));
+        assert_eq!(
+            products[1].skus[0].card_program.as_deref(),
+            Some("Wong Prime")
+        );
+    }
+
+    #[test]
+    fn vtex_supports_camelcase_teasers_retailer_fallbacks_and_codigo_de_barras_spec() {
+        let fixture = r#"[
+          {
+            "productId": "6001",
+            "productName": "Mantequilla Gloria",
+            "Código de barras": ["7751271034142"],
+            "items": [{
+              "itemId": "60011",
+              "ean": "",
+              "name": "Mantequilla 200g",
+              "sellers": [{
+                "sellerId": "1",
+                "commertialOffer": {
+                  "ListPrice": 12.00,
+                  "Price": 10.00,
+                  "AvailableQuantity": 5,
+                  "teasers": [
+                    {
+                      "name": "Solo 2 unidades",
+                      "conditions": {"minimumQuantity": 2, "parameters": []},
+                      "effects": {
+                        "parameters": [{"name": "PromotionalPrice", "value": "5.00"}]
+                      }
+                    },
+                    {
+                      "name": "Promocion Tarjeta Tienda",
+                      "conditions": {
+                        "minimumQuantity": 1,
+                        "parameters": [{"name": "PaymentMethodId", "value": "202"}]
+                      },
+                      "effects": {
+                        "parameters": [{"name": "PromotionalPrice", "value": "8.50"}]
+                      }
+                    }
+                  ]
+                }
+              }]
+            }]
+          }
+        ]"#;
+
+        let ctx = FetchContext::for_run(Uuid::new_v4(), "PE", None);
+
+        let pv = VtexAdapter::new(VtexRetailer::PlazaVea, test_http());
+        let pv_products = pv.parse_page_payload(fixture, &ctx).unwrap();
+        assert_eq!(pv_products[0].skus[0].ean.as_deref(), Some("7751271034142"));
+        assert_eq!(pv_products[0].skus[0].card_price, Some(8.50));
+        assert_eq!(pv_products[0].skus[0].card_program.as_deref(), Some("Oh!"));
+
+        // Same PaymentMethodId "202" on Metro/Wong must NOT classify as "Oh!" and falls back to "Cencosud".
+        let metro = VtexAdapter::new(VtexRetailer::Metro, test_http());
+        let metro_products = metro.parse_page_payload(fixture, &ctx).unwrap();
+        assert_eq!(metro_products[0].skus[0].card_price, Some(8.50));
+        assert_eq!(
+            metro_products[0].skus[0].card_program.as_deref(),
+            Some("Cencosud")
+        );
+
+        let wong = VtexAdapter::new(VtexRetailer::Wong, test_http());
+        let wong_products = wong.parse_page_payload(fixture, &ctx).unwrap();
+        assert_eq!(wong_products[0].skus[0].card_price, Some(8.50));
+        assert_eq!(
+            wong_products[0].skus[0].card_program.as_deref(),
+            Some("Cencosud")
+        );
     }
 }

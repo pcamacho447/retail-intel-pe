@@ -12,6 +12,8 @@ pub struct CheckpointState {
     pub category: String,
     pub next_offset: usize,
     pub pages_completed: usize,
+    #[serde(default)]
+    pub page_size: Option<usize>,
     pub extraction_run_id: Uuid,
     pub updated_at: DateTime<Utc>,
     pub completed: bool,
@@ -63,20 +65,51 @@ impl CheckpointStore {
         self.checkpoints_dir.join(filename)
     }
 
+    pub fn hashed_path_for(&self, retailer: &str, category: &str) -> PathBuf {
+        let digest = crate::dedup::compute_payload_hash(&format!("{retailer}\0{category}"));
+        let short_hash = &digest[..8];
+        let filename = format!(
+            "{}_{}_{}.json",
+            sanitize_category(retailer),
+            sanitize_category(category),
+            short_hash
+        );
+        self.checkpoints_dir.join(filename)
+    }
+
+    fn read_state(path: &Path) -> anyhow::Result<CheckpointState> {
+        let bytes = fs::read(path)
+            .with_context(|| format!("failed to read checkpoint {}", path.display()))?;
+        serde_json::from_slice(&bytes)
+            .with_context(|| format!("failed to parse checkpoint {}", path.display()))
+    }
+
+    pub fn resolve_path_for_category(
+        &self,
+        retailer: &str,
+        category: &str,
+    ) -> anyhow::Result<PathBuf> {
+        let primary = self.path_for(retailer, category);
+        if primary.exists() {
+            let state = Self::read_state(&primary)?;
+            if state.retailer == retailer && state.category == category {
+                return Ok(primary);
+            }
+            return Ok(self.hashed_path_for(retailer, category));
+        }
+        Ok(primary)
+    }
+
     pub fn load(&self, retailer: &str, category: &str) -> anyhow::Result<Option<CheckpointState>> {
-        let path = self.path_for(retailer, category);
+        let path = self.resolve_path_for_category(retailer, category)?;
         if !path.exists() {
             return Ok(None);
         }
-        let bytes = fs::read(&path)
-            .with_context(|| format!("failed to read checkpoint {}", path.display()))?;
-        let state: CheckpointState = serde_json::from_slice(&bytes)
-            .with_context(|| format!("failed to parse checkpoint {}", path.display()))?;
-        Ok(Some(state))
+        Self::read_state(&path).map(Some)
     }
 
     pub fn save(&self, state: &CheckpointState) -> anyhow::Result<()> {
-        let path = self.path_for(&state.retailer, &state.category);
+        let path = self.resolve_path_for_category(&state.retailer, &state.category)?;
         let bytes = serde_json::to_vec_pretty(state)?;
         crate::atomic_write(&path, &bytes)
     }
@@ -116,6 +149,7 @@ mod tests {
             category: "leche/evaporada".to_string(),
             next_offset: 40,
             pages_completed: 2,
+            page_size: Some(20),
             extraction_run_id: run_id,
             updated_at: now,
             completed: false,
@@ -142,5 +176,94 @@ mod tests {
         let reloaded2 = store.load("tottus", "leche/evaporada").unwrap().unwrap();
         assert_eq!(reloaded2, updated);
         assert!(reloaded2.completed);
+    }
+
+    #[test]
+    fn checkpoint_store_disambiguates_colliding_category_slugs() {
+        let dir = TempDir::new().unwrap();
+        let store = CheckpointStore::new(dir.path());
+        let now = Utc::now();
+
+        let slash_state = CheckpointState {
+            retailer: "tottus".to_string(),
+            category: "leche/entera".to_string(),
+            next_offset: 20,
+            pages_completed: 1,
+            page_size: Some(20),
+            extraction_run_id: Uuid::new_v4(),
+            updated_at: now,
+            completed: false,
+        };
+        let space_state = CheckpointState {
+            retailer: "tottus".to_string(),
+            category: "leche entera".to_string(),
+            next_offset: 60,
+            pages_completed: 3,
+            page_size: Some(20),
+            extraction_run_id: Uuid::new_v4(),
+            updated_at: now,
+            completed: true,
+        };
+
+        store.save(&slash_state).unwrap();
+        assert_eq!(
+            store.load("tottus", "leche entera").unwrap(),
+            None,
+            "unseen colliding category must not load the primary category's checkpoint"
+        );
+
+        store.save(&space_state).unwrap();
+
+        let primary_path = store.path_for("tottus", "leche/entera");
+        assert!(primary_path.exists());
+        let hashed_path = store.hashed_path_for("tottus", "leche entera");
+        assert_ne!(primary_path, hashed_path);
+        assert!(hashed_path.exists());
+
+        assert_eq!(
+            store.load("tottus", "leche/entera").unwrap(),
+            Some(slash_state.clone())
+        );
+        assert_eq!(
+            store.load("tottus", "leche entera").unwrap(),
+            Some(space_state.clone())
+        );
+
+        let updated_space = CheckpointState {
+            next_offset: 80,
+            pages_completed: 4,
+            ..space_state
+        };
+        store.save(&updated_space).unwrap();
+        assert_eq!(
+            store.load("tottus", "leche/entera").unwrap(),
+            Some(slash_state)
+        );
+        assert_eq!(
+            store.load("tottus", "leche entera").unwrap(),
+            Some(updated_space)
+        );
+    }
+
+    #[test]
+    fn checkpoint_state_defaults_missing_page_size_to_none() {
+        let dir = TempDir::new().unwrap();
+        let store = CheckpointStore::new(dir.path());
+        let legacy_json = r#"{
+            "retailer": "plazavea",
+            "category": "lacteos",
+            "next_offset": 20,
+            "pages_completed": 1,
+            "extraction_run_id": "11111111-1111-4111-8111-111111111111",
+            "updated_at": "2026-11-13T18:00:00Z",
+            "completed": false
+        }"#;
+        let path = store.path_for("plazavea", "lacteos");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, legacy_json).unwrap();
+
+        let loaded = store.load("plazavea", "lacteos").unwrap().unwrap();
+        assert_eq!(loaded.page_size, None);
+        assert_eq!(loaded.next_offset, 20);
     }
 }

@@ -34,6 +34,7 @@ pub fn bronze_arrow_schema() -> Arc<Schema> {
         Field::new("list_price", DataType::Float64, true),
         Field::new("selling_price", DataType::Float64, true),
         Field::new("card_price", DataType::Float64, true),
+        Field::new("card_program", DataType::Utf8, true),
         Field::new("available_qty", DataType::Int64, true),
         Field::new("currency", DataType::Utf8, false),
         Field::new("sales_channel", DataType::Utf8, false),
@@ -82,6 +83,7 @@ fn build_record_batch(schema: Arc<Schema>, rows: &[BronzeSkuRow]) -> anyhow::Res
     let list_price = Float64Array::from_iter(rows.iter().map(|r| r.list_price));
     let selling_price = Float64Array::from_iter(rows.iter().map(|r| r.selling_price));
     let card_price = Float64Array::from_iter(rows.iter().map(|r| r.card_price));
+    let card_program = StringArray::from_iter(rows.iter().map(|r| r.card_program.as_deref()));
     let available_qty = Int64Array::from_iter(rows.iter().map(|r| r.available_qty));
     let currency = StringArray::from_iter_values(rows.iter().map(|r| r.currency.as_str()));
     let sales_channel =
@@ -122,6 +124,7 @@ fn build_record_batch(schema: Arc<Schema>, rows: &[BronzeSkuRow]) -> anyhow::Res
             Arc::new(list_price),
             Arc::new(selling_price),
             Arc::new(card_price),
+            Arc::new(card_program),
             Arc::new(available_qty),
             Arc::new(currency),
             Arc::new(sales_channel),
@@ -220,6 +223,7 @@ mod tests {
                 list_price: Some(5.00),
                 selling_price: Some(4.20),
                 card_price: Some(3.99),
+                card_program: Some("Oh!".to_string()),
                 available_qty: Some(42),
                 currency: "PEN".to_string(),
                 sales_channel: "ecommerce".to_string(),
@@ -250,6 +254,7 @@ mod tests {
                 list_price: None,
                 selling_price: None,
                 card_price: None,
+                card_program: None,
                 available_qty: None,
                 currency: "PEN".to_string(),
                 sales_channel: "ecommerce".to_string(),
@@ -281,9 +286,9 @@ mod tests {
     }
 
     #[test]
-    fn bronze_arrow_schema_has_exact_28_columns_types_and_nullability() {
+    fn bronze_arrow_schema_has_exact_29_columns_types_and_nullability() {
         let schema = bronze_arrow_schema();
-        assert_eq!(schema.fields().len(), 28);
+        assert_eq!(schema.fields().len(), 29);
 
         let expected = [
             ("retailer", DataType::Utf8, false),
@@ -302,6 +307,7 @@ mod tests {
             ("list_price", DataType::Float64, true),
             ("selling_price", DataType::Float64, true),
             ("card_price", DataType::Float64, true),
+            ("card_program", DataType::Utf8, true),
             ("available_qty", DataType::Int64, true),
             ("currency", DataType::Utf8, false),
             ("sales_channel", DataType::Utf8, false),
@@ -362,7 +368,7 @@ mod tests {
             .unwrap();
         let batch = arrow_reader.next().unwrap().unwrap();
         assert_eq!(batch.num_rows(), 2);
-        assert_eq!(batch.num_columns(), 28);
+        assert_eq!(batch.num_columns(), 29);
 
         let sku_col = batch
             .column_by_name("sku_id")
@@ -390,6 +396,15 @@ mod tests {
             .unwrap();
         assert_eq!(selling_col.value(0), 4.20);
         assert!(selling_col.is_null(1));
+
+        let card_prog_col = batch
+            .column_by_name("card_program")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(card_prog_col.value(0), "Oh!");
+        assert!(card_prog_col.is_null(1));
 
         let qty_col = batch
             .column_by_name("available_qty")
@@ -449,7 +464,7 @@ mod tests {
             .unwrap()
             .build()
             .unwrap();
-        assert_eq!(reader.schema().fields().len(), 28);
+        assert_eq!(reader.schema().fields().len(), 29);
         let total_rows: usize = reader.map(|b| b.unwrap().num_rows()).sum();
         assert_eq!(total_rows, 0);
     }

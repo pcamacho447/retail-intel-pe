@@ -76,10 +76,8 @@ CREATE TABLE IF NOT EXISTS dim_trade_item (
     updated_at              TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
--- Explicit GTIN index excluding NULLs for deterministic Level-1 matching
-CREATE INDEX IF NOT EXISTS idx_dim_trade_item_gtin
-    ON dim_trade_item (gtin)
-    WHERE gtin IS NOT NULL;
+-- Intentionally omitted idx_dim_trade_item_gtin: `gtin VARCHAR(14) UNIQUE` above
+-- already creates a full unique B-tree index in PostgreSQL (and allows NULLs).
 
 CREATE INDEX IF NOT EXISTS idx_dim_trade_item_family_id
     ON dim_trade_item (family_id);
