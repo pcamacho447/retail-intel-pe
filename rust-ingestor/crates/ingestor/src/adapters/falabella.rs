@@ -274,7 +274,11 @@ fn is_thousands_grouped(s: &str, sep: char) -> bool {
     let Some(head) = parts.next() else {
         return false;
     };
-    if head.is_empty() || head.len() > 3 || !head.bytes().all(|b| b.is_ascii_digit()) {
+    if head.is_empty()
+        || head.len() > 3
+        || head.starts_with('0')
+        || !head.bytes().all(|b| b.is_ascii_digit())
+    {
         return false;
     }
     let mut has_tail = false;
@@ -1423,6 +1427,11 @@ mod tests {
         );
         assert_eq!(parse_price_value(&serde_json::json!("1,5")), Some(1.5));
         assert_eq!(parse_price_value(&serde_json::json!("27")), Some(27.0));
+        assert_eq!(parse_price_value(&serde_json::json!("0,500")), Some(0.5));
+        assert_eq!(
+            parse_price_value(&serde_json::json!("S/ 0,990")),
+            Some(0.99)
+        );
     }
 
     #[test]
