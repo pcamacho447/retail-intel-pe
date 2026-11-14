@@ -2,7 +2,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -15,6 +15,16 @@ pub struct CheckpointState {
     pub extraction_run_id: Uuid,
     pub updated_at: DateTime<Utc>,
     pub completed: bool,
+    #[serde(default)]
+    pub page_size: Option<usize>,
+}
+
+impl CheckpointState {
+    pub fn is_valid_for_run(&self, category: &str, run_date: NaiveDate, page_size: usize) -> bool {
+        self.category == category
+            && self.updated_at.date_naive() == run_date
+            && self.page_size.is_none_or(|ps| ps == page_size)
+    }
 }
 
 pub struct CheckpointStore {
@@ -119,6 +129,7 @@ mod tests {
             extraction_run_id: run_id,
             updated_at: now,
             completed: false,
+            page_size: Some(20),
         };
 
         store.save(&state).unwrap();
@@ -142,5 +153,55 @@ mod tests {
         let reloaded2 = store.load("tottus", "leche/evaporada").unwrap().unwrap();
         assert_eq!(reloaded2, updated);
         assert!(reloaded2.completed);
+    }
+
+    #[test]
+    fn checkpoint_is_valid_for_run_checks_date_category_and_page_size() {
+        let today = Utc::now().date_naive();
+        let cp = CheckpointState {
+            retailer: "metro".to_string(),
+            category: "leche/entera".to_string(),
+            next_offset: 20,
+            pages_completed: 1,
+            extraction_run_id: Uuid::new_v4(),
+            updated_at: Utc::now(),
+            completed: false,
+            page_size: Some(20),
+        };
+
+        // Matching run
+        assert!(cp.is_valid_for_run("leche/entera", today, 20));
+
+        // Different date (tomorrow)
+        let tomorrow = today.succ_opt().unwrap();
+        assert!(!cp.is_valid_for_run("leche/entera", tomorrow, 20));
+
+        // Category collision (slug collision where store sanitized to same filename, but category string differs)
+        assert!(!cp.is_valid_for_run("leche entera", today, 20));
+
+        // Different page_size
+        assert!(!cp.is_valid_for_run("leche/entera", today, 50));
+
+        // Legacy JSON without page_size deserializes with page_size: None
+        let legacy_json = format!(
+            r#"{{
+                "retailer": "metro",
+                "category": "leche/entera",
+                "next_offset": 20,
+                "pages_completed": 1,
+                "extraction_run_id": "{}",
+                "updated_at": "{}",
+                "completed": false
+            }}"#,
+            cp.extraction_run_id,
+            cp.updated_at.to_rfc3339()
+        );
+        let legacy_cp: CheckpointState = serde_json::from_str(&legacy_json).unwrap();
+        assert_eq!(legacy_cp.page_size, None);
+        // Returns true for any page_size on the same date and category
+        assert!(legacy_cp.is_valid_for_run("leche/entera", today, 20));
+        assert!(legacy_cp.is_valid_for_run("leche/entera", today, 50));
+        assert!(!legacy_cp.is_valid_for_run("leche/entera", tomorrow, 20));
+        assert!(!legacy_cp.is_valid_for_run("leche entera", today, 20));
     }
 }

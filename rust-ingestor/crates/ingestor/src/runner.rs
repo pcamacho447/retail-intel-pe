@@ -61,23 +61,36 @@ pub async fn run_ingest(
 
         if config.resume {
             if let Some(cp) = checkpoints.load(slug, category)? {
-                if cp.completed {
+                if cp.is_valid_for_run(category, run_date, config.page_size) {
+                    if cp.completed {
+                        tracing::info!(
+                            retailer = slug,
+                            category = %category,
+                            "Skipping already completed category from checkpoint"
+                        );
+                        continue;
+                    }
+                    offset = cp.next_offset;
+                    pages_completed_total = cp.pages_completed;
                     tracing::info!(
                         retailer = slug,
                         category = %category,
-                        "Skipping already completed category from checkpoint"
+                        offset = offset,
+                        pages_completed = pages_completed_total,
+                        "Resuming category from checkpoint"
                     );
-                    continue;
+                } else {
+                    tracing::info!(
+                        retailer = slug,
+                        category = %category,
+                        checkpoint_date = %cp.updated_at.date_naive(),
+                        run_date = %run_date,
+                        checkpoint_page_size = ?cp.page_size,
+                        run_page_size = config.page_size,
+                        checkpoint_category = %cp.category,
+                        "Ignoring stale or mismatched checkpoint"
+                    );
                 }
-                offset = cp.next_offset;
-                pages_completed_total = cp.pages_completed;
-                tracing::info!(
-                    retailer = slug,
-                    category = %category,
-                    offset = offset,
-                    pages_completed = pages_completed_total,
-                    "Resuming category from checkpoint"
-                );
             }
         }
 
@@ -115,6 +128,7 @@ pub async fn run_ingest(
                         extraction_run_id,
                         updated_at: Utc::now(),
                         completed,
+                        page_size: Some(config.page_size),
                     });
 
                     if completed {
@@ -377,6 +391,7 @@ mod tests {
                 extraction_run_id: Uuid::new_v4(),
                 updated_at: Utc::now(),
                 completed: true,
+                page_size: Some(20),
             })
             .unwrap();
         store
@@ -388,6 +403,7 @@ mod tests {
                 extraction_run_id: Uuid::new_v4(),
                 updated_at: Utc::now(),
                 completed: false,
+                page_size: Some(20),
             })
             .unwrap();
 
@@ -489,5 +505,45 @@ mod tests {
             cp_store.load("plazavea", "lacteos").unwrap().is_none(),
             "checkpoint must not be persisted when Parquet write fails"
         );
+    }
+
+    #[tokio::test]
+    async fn run_ingest_resume_ignores_stale_previous_day_checkpoint() {
+        let dir = TempDir::new().unwrap();
+        let store = CheckpointStore::new(dir.path());
+        let yesterday = Utc::now() - chrono::Duration::days(1);
+        store
+            .save(&CheckpointState {
+                retailer: "metro".to_string(),
+                category: "lacteos".to_string(),
+                next_offset: 20,
+                pages_completed: 1,
+                extraction_run_id: Uuid::new_v4(),
+                updated_at: yesterday,
+                completed: true,
+                page_size: Some(20),
+            })
+            .unwrap();
+
+        let page_json = r#"[{"productId":"100","productName":"Leche Fresca","items":[{"itemId":"1001","ean":"7751234567890","name":"Leche Fresca","sellers":[]}]}]"#;
+        let (base_url, calls) = spawn_vtex_sequence(vec![(200, page_json.to_string())]).await;
+
+        let http = fast_http();
+        let adapter = VtexAdapter::with_base_url(VtexRetailer::Metro, &base_url, http.clone());
+        let cfg = IngestConfig {
+            retailer: "metro".to_string(),
+            categories: vec!["lacteos".to_string()],
+            page_size: 20,
+            max_pages: 1,
+            output_dir: dir.path().to_path_buf(),
+            resume: true,
+            market_id: "PE".to_string(),
+            postal_code: None,
+        };
+
+        let metrics = run_ingest(&adapter, &http, &cfg).await.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(metrics.pages_fetched, 1);
+        assert_eq!(metrics.products_recovered, 1);
     }
 }
