@@ -284,14 +284,15 @@ impl RetailerAdapter for VtexAdapter {
 
         let mut products = Vec::with_capacity(items.len());
         for elem in items {
+            let Some(product_id) = value_as_string(elem.get("productId")) else {
+                tracing::warn!(
+                    retailer = %self.retailer_slug(),
+                    "VTEX product object missing productId; skipping item"
+                );
+                continue;
+            };
             let raw_payload = serde_json::to_string(elem)?;
             let payload_hash = compute_payload_hash(&raw_payload);
-            let product_id = value_as_string(elem.get("productId")).ok_or_else(|| {
-                anyhow!(
-                    "VTEX product object missing productId (retailer={})",
-                    self.retailer_slug()
-                )
-            })?;
             let raw_name = normalize_opt_string(
                 elem.get("productName")
                     .or_else(|| elem.get("productTitle"))
@@ -775,11 +776,46 @@ mod tests {
         assert_eq!(batch.products.len(), 1);
 
         let req = req_rx.recv().await.unwrap();
-        assert!(req.contains("_postalCode=15001"), "request missing _postalCode: {req}");
-        assert!(req.contains("_storeId=TIENDA_1"), "request missing _storeId: {req}");
+        assert!(
+            req.contains("_postalCode=15001"),
+            "request missing _postalCode: {req}"
+        );
+        assert!(
+            req.contains("_storeId=TIENDA_1"),
+            "request missing _storeId: {req}"
+        );
 
         let endpoint = &batch.products[0].source_endpoint;
-        assert!(endpoint.contains("_postalCode=15001"), "product endpoint missing _postalCode: {endpoint}");
-        assert!(endpoint.contains("_storeId=TIENDA_1"), "product endpoint missing _storeId: {endpoint}");
+        assert!(
+            endpoint.contains("_postalCode=15001"),
+            "product endpoint missing _postalCode: {endpoint}"
+        );
+        assert!(
+            endpoint.contains("_storeId=TIENDA_1"),
+            "product endpoint missing _storeId: {endpoint}"
+        );
+    }
+
+    #[test]
+    fn vtex_skips_item_missing_product_id_and_parses_valid_items() {
+        let fixture = r#"[
+          {
+            "productName": "Invalid Product Without Id",
+            "items": []
+          },
+          {
+            "productId": "888",
+            "productName": "Valid Product",
+            "items": []
+          }
+        ]"#;
+
+        let adapter = VtexAdapter::new(VtexRetailer::PlazaVea, test_http());
+        let ctx = FetchContext::for_run(Uuid::new_v4(), "PE", None);
+        let products = adapter
+            .parse_page_payload(fixture, &ctx)
+            .expect("should succeed");
+        assert_eq!(products.len(), 1);
+        assert_eq!(products[0].product_id, "888");
     }
 }

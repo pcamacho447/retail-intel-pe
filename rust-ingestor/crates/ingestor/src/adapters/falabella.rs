@@ -85,14 +85,34 @@ fn parse_price_value(raw: &Value) -> Option<f64> {
     }
 
     let s = scalar.as_str()?;
-    let cleaned: String = s
+    let segment = s.split('-').next().unwrap_or(s);
+    let first_digit_pos = segment.find(|ch: char| ch.is_ascii_digit())?;
+    let from_first_digit = &segment[first_digit_pos..];
+
+    let filtered: String = from_first_digit
         .chars()
-        .filter(|ch| ch.is_ascii_digit() || *ch == '.')
+        .filter(|ch| ch.is_ascii_digit() || *ch == '.' || *ch == ',')
         .collect();
-    if cleaned.is_empty() {
+
+    if filtered.is_empty() {
         return None;
     }
-    let parsed: f64 = cleaned.parse().ok()?;
+
+    let normalized = if filtered.contains('.') && filtered.contains(',') {
+        let last_dot = filtered.rfind('.').unwrap();
+        let last_comma = filtered.rfind(',').unwrap();
+        if last_dot > last_comma {
+            filtered.replace(',', "")
+        } else {
+            filtered.replace('.', "").replace(',', ".")
+        }
+    } else if filtered.contains(',') {
+        filtered.replace(',', ".")
+    } else {
+        filtered
+    };
+
+    let parsed: f64 = normalized.parse().ok()?;
     if parsed.is_finite() && parsed > 0.0 {
         Some(parsed)
     } else {
@@ -153,14 +173,15 @@ fn parse_results_from_root(
 
     let mut products = Vec::with_capacity(results.len());
     for item in results {
+        let Some(product_id) = value_as_string(item.get("productId")) else {
+            tracing::warn!(
+                http_status = ctx.http_status,
+                "Falabella/Tottus result item missing productId; skipping item"
+            );
+            continue;
+        };
         let raw_payload = serde_json::to_string(item)?;
         let payload_hash = compute_payload_hash(&raw_payload);
-        let product_id = value_as_string(item.get("productId")).ok_or_else(|| {
-            anyhow!(
-                "Falabella/Tottus result item missing productId (http_status={})",
-                ctx.http_status
-            )
-        })?;
         let sku_id = value_as_string(item.get("skuId")).unwrap_or_else(|| product_id.clone());
         let raw_name = normalize_opt_string(
             item.get("displayName")
@@ -558,11 +579,73 @@ mod tests {
         assert_eq!(batch.products.len(), 1);
 
         let req = req_rx.recv().await.unwrap();
-        assert!(req.contains("postalCode=15001"), "request missing postalCode: {req}");
-        assert!(req.contains("storeId=TIENDA_1"), "request missing storeId: {req}");
+        assert!(
+            req.contains("postalCode=15001"),
+            "request missing postalCode: {req}"
+        );
+        assert!(
+            req.contains("storeId=TIENDA_1"),
+            "request missing storeId: {req}"
+        );
 
         let endpoint = &batch.products[0].source_endpoint;
-        assert!(endpoint.contains("postalCode=15001"), "product endpoint missing postalCode: {endpoint}");
-        assert!(endpoint.contains("storeId=TIENDA_1"), "product endpoint missing storeId: {endpoint}");
+        assert!(
+            endpoint.contains("postalCode=15001"),
+            "product endpoint missing postalCode: {endpoint}"
+        );
+        assert!(
+            endpoint.contains("storeId=TIENDA_1"),
+            "product endpoint missing storeId: {endpoint}"
+        );
+    }
+
+    #[test]
+    fn falabella_parse_price_handles_peruvian_currency_prefixes_commas_and_ranges() {
+        assert_eq!(
+            parse_price_value(&serde_json::json!("S/. 4.50")),
+            Some(4.50)
+        );
+        assert_eq!(parse_price_value(&serde_json::json!("S/ 4,50")), Some(4.50));
+        assert_eq!(
+            parse_price_value(&serde_json::json!("S/ 1,299.90")),
+            Some(1299.90)
+        );
+        assert_eq!(
+            parse_price_value(&serde_json::json!("S/ 1.299,90")),
+            Some(1299.90)
+        );
+        assert_eq!(
+            parse_price_value(&serde_json::json!("S/ 4.50 - S/ 6.00")),
+            Some(4.50)
+        );
+    }
+
+    #[test]
+    fn falabella_skips_item_missing_product_id_and_parses_valid_items() {
+        let json = r#"{
+          "props": {
+            "pageProps": {
+              "results": [
+                {
+                  "displayName": "Item without productId",
+                  "prices": []
+                },
+                {
+                  "productId": "999",
+                  "displayName": "Valid Product",
+                  "prices": []
+                }
+              ]
+            }
+          }
+        }"#;
+
+        let adapter = FalabellaListingAdapter::new_tottus(test_http());
+        let ctx = FetchContext::for_run(Uuid::new_v4(), "PE", None);
+        let products = adapter
+            .parse_page_payload(json, &ctx)
+            .expect("should succeed");
+        assert_eq!(products.len(), 1);
+        assert_eq!(products[0].product_id, "999");
     }
 }
