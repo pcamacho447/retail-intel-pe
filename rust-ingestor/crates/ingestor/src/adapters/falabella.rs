@@ -717,7 +717,7 @@ fn parse_results_from_root(
     extractor_version: &str,
     volatile_keys: &[&str],
     ctx: &FetchContext,
-) -> anyhow::Result<Vec<Product>> {
+) -> anyhow::Result<(Vec<Product>, usize)> {
     let results = root
         .pointer("/props/pageProps/results")
         .or_else(|| root.get("results"))
@@ -730,8 +730,10 @@ fn parse_results_from_root(
         })?;
 
     let mut products = Vec::with_capacity(results.len());
+    let mut rejected = 0usize;
     for item in results {
         let Some(product_id) = value_as_string(item.get("productId")) else {
+            rejected += 1;
             tracing::warn!(
                 http_status = ctx.http_status,
                 "Falabella/Tottus result item missing productId; skipping item"
@@ -816,7 +818,7 @@ fn parse_results_from_root(
         });
     }
 
-    Ok(products)
+    Ok((products, rejected))
 }
 
 fn has_more_pages(root: &Value, products_len: usize, page_size: usize) -> bool {
@@ -881,6 +883,7 @@ impl RetailerAdapter for FalabellaListingAdapter {
             self.volatile_payload_keys(),
             ctx,
         )
+        .map(|(products, _)| products)
     }
 
     async fn fetch_page(
@@ -894,14 +897,14 @@ impl RetailerAdapter for FalabellaListingAdapter {
         let resp = self.http.get_text(&url).await?;
         let page_ctx = ctx.clone().with_endpoint(url, resp.status);
         let root = extract_next_data_json(&resp.body, resp.status)?;
-        let mut products = parse_results_from_root(
+        let (mut products, products_rejected) = parse_results_from_root(
             &root,
             &self.base_url,
             self.extractor_version(),
             self.volatile_payload_keys(),
             &page_ctx,
         )?;
-        let has_more = has_more_pages(&root, products.len(), page_size);
+        let has_more = has_more_pages(&root, products.len() + products_rejected, page_size);
         let mut total_bytes = resp.bytes;
 
         let to_fetch = self
@@ -973,7 +976,7 @@ impl RetailerAdapter for FalabellaListingAdapter {
             raw_bytes: total_bytes,
             http_status: resp.status,
             latency_ms: resp.latency_ms,
-            products_rejected: 0,
+            products_rejected,
         })
     }
 }
@@ -1449,6 +1452,18 @@ mod tests {
             .expect("should succeed");
         assert_eq!(products.len(), 1);
         assert_eq!(products[0].product_id, "999");
+
+        let root: Value = serde_json::from_str(json).unwrap();
+        let (parsed, rejected) = parse_results_from_root(
+            &root,
+            &adapter.base_url,
+            adapter.extractor_version(),
+            adapter.volatile_payload_keys(),
+            &ctx,
+        )
+        .unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(rejected, 1);
     }
 
     #[test]
