@@ -270,6 +270,24 @@ fn extract_next_data_json(body: &str, http_status: u16) -> anyhow::Result<Value>
     })
 }
 
+fn is_thousands_grouped(s: &str, sep: char) -> bool {
+    let mut parts = s.split(sep);
+    let Some(head) = parts.next() else {
+        return false;
+    };
+    if head.is_empty() || head.len() > 3 || !head.bytes().all(|b| b.is_ascii_digit()) {
+        return false;
+    }
+    let mut has_tail = false;
+    for part in parts {
+        if part.len() != 3 || !part.bytes().all(|b| b.is_ascii_digit()) {
+            return false;
+        }
+        has_tail = true;
+    }
+    has_tail
+}
+
 fn parse_price_value(raw: &Value) -> Option<f64> {
     let scalar = match raw {
         Value::Array(arr) => arr.first()?,
@@ -307,7 +325,11 @@ fn parse_price_value(raw: &Value) -> Option<f64> {
             filtered.replace('.', "").replace(',', ".")
         }
     } else if filtered.contains(',') {
-        filtered.replace(',', ".")
+        if is_thousands_grouped(&filtered, ',') {
+            filtered.replace(',', "")
+        } else {
+            filtered.replace(',', ".")
+        }
     } else {
         filtered
     };
@@ -1396,6 +1418,21 @@ mod tests {
             parse_price_value(&serde_json::json!("S/ 4.50 - S/ 6.00")),
             Some(4.50)
         );
+        assert_eq!(parse_price_value(&serde_json::json!("1,299")), Some(1299.0));
+        assert_eq!(
+            parse_price_value(&serde_json::json!("S/ 1,299")),
+            Some(1299.0)
+        );
+        assert_eq!(
+            parse_price_value(&serde_json::json!("12,999")),
+            Some(12999.0)
+        );
+        assert_eq!(
+            parse_price_value(&serde_json::json!("1,299,000")),
+            Some(1_299_000.0)
+        );
+        assert_eq!(parse_price_value(&serde_json::json!("1,5")), Some(1.5));
+        assert_eq!(parse_price_value(&serde_json::json!("27")), Some(27.0));
     }
 
     #[test]
