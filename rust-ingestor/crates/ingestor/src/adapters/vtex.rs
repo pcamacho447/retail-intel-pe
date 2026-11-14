@@ -6,7 +6,7 @@ use serde_json::Value;
 
 use crate::adapter::{FetchContext, PageBatch, RetailerAdapter};
 use crate::adapters::{absolutize_url, encode_url_segment, value_as_string};
-use crate::dedup::compute_payload_hash;
+use crate::dedup::{compute_content_hash, compute_payload_hash};
 use crate::domain::{normalize_opt_string, validate_gtin_mod10, Product, SkuItem};
 use crate::http::RateLimitedHttpClient;
 
@@ -385,7 +385,15 @@ fn parse_vtex_sku(
     Some(SkuItem {
         sku_id,
         ean,
+        ean_source: None,
+        availability_status: "unknown".to_string(),
+        availability_source: "none".to_string(),
         seller_id,
+        seller_name: None,
+        seller_count: None,
+        is_default_seller: None,
+        measurement_unit: None,
+        unit_multiplier: None,
         raw_name,
         image_url,
         list_price,
@@ -404,6 +412,14 @@ impl RetailerAdapter for VtexAdapter {
 
     fn extractor_version(&self) -> &'static str {
         "vtex-catalog-v1.0.0"
+    }
+
+    fn volatile_payload_keys(&self) -> &'static [&'static str] {
+        &[
+            "PriceToken",
+            "PriceValidUntil",
+            "CacheVersionUsedToCallCheckout",
+        ]
     }
 
     fn build_page_url(&self, category_or_query: &str, offset: usize, page_size: usize) -> String {
@@ -443,9 +459,11 @@ impl RetailerAdapter for VtexAdapter {
         })?;
 
         let mut products = Vec::with_capacity(items.len());
+        let volatile_keys = self.volatile_payload_keys();
         for elem in items {
             let raw_payload = serde_json::to_string(elem)?;
             let payload_hash = compute_payload_hash(&raw_payload);
+            let content_hash = compute_content_hash(&raw_payload, volatile_keys);
             let product_id = value_as_string(elem.get("productId")).ok_or_else(|| {
                 anyhow!(
                     "VTEX product object missing productId (retailer={})",
@@ -501,6 +519,8 @@ impl RetailerAdapter for VtexAdapter {
                 http_status: ctx.http_status,
                 payload_hash,
                 raw_payload,
+                query_term: ctx.query_term.clone(),
+                content_hash,
                 skus,
             });
         }
@@ -530,6 +550,7 @@ impl RetailerAdapter for VtexAdapter {
             raw_bytes: resp.bytes,
             http_status: resp.status,
             latency_ms: resp.latency_ms,
+            products_rejected: 0,
         })
     }
 }
@@ -1376,5 +1397,55 @@ mod tests {
             wong_products[0].skus[0].card_program.as_deref(),
             Some("Cencosud")
         );
+    }
+
+    #[test]
+    fn vtex_product_carries_query_term_and_content_hash() {
+        let adapter = VtexAdapter::new(VtexRetailer::Wong, test_http());
+        let ctx = FetchContext::for_run(Uuid::new_v4(), "PE", None).with_query_term("lacteos");
+
+        let body_a = r#"[{
+          "productId": "7001",
+          "productName": "Leche Fresca",
+          "items": [{
+            "itemId": "70011",
+            "name": "Leche Fresca 1L",
+            "sellers": [{
+              "sellerId": "1",
+              "commertialOffer": {
+                "Price": 5.90,
+                "PriceToken": "token_one",
+                "PriceValidUntil": "2026-11-14T01:00:00Z",
+                "CacheVersionUsedToCallCheckout": "cache_1"
+              }
+            }]
+          }]
+        }]"#;
+        let body_b = r#"[{
+          "productId": "7001",
+          "productName": "Leche Fresca",
+          "items": [{
+            "itemId": "70011",
+            "name": "Leche Fresca 1L",
+            "sellers": [{
+              "sellerId": "1",
+              "commertialOffer": {
+                "Price": 5.90,
+                "PriceToken": "token_two",
+                "PriceValidUntil": "2026-11-14T01:30:00Z",
+                "CacheVersionUsedToCallCheckout": "cache_2"
+              }
+            }]
+          }]
+        }]"#;
+
+        let pa = adapter.parse_page_payload(body_a, &ctx).unwrap();
+        let pb = adapter.parse_page_payload(body_b, &ctx).unwrap();
+        assert_eq!(pa.len(), 1);
+        assert_eq!(pb.len(), 1);
+        assert_eq!(pa[0].query_term, "lacteos");
+        assert_eq!(pb[0].query_term, "lacteos");
+        assert_eq!(pa[0].content_hash, pb[0].content_hash);
+        assert_ne!(pa[0].payload_hash, pb[0].payload_hash);
     }
 }

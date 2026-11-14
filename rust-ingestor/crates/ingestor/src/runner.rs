@@ -86,11 +86,12 @@ pub async fn run_ingest(
             }
         }
 
+        let category_ctx = base_ctx.clone().with_query_term(category);
         let mut pages_this_run = 0usize;
         let mut latest_cp: Option<CheckpointState> = None;
         while pages_this_run < config.max_pages {
             match adapter
-                .fetch_page(category, offset, effective_page_size, &base_ctx)
+                .fetch_page(category, offset, effective_page_size, &category_ctx)
                 .await
             {
                 Ok(batch) => {
@@ -378,6 +379,22 @@ mod tests {
             .downcast_ref::<StringArray>()
             .unwrap();
         assert!(raw_col.is_null(0));
+
+        let query_term_col = batch
+            .column_by_name("query_term")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(query_term_col.value(0), "lacteos");
+
+        let contract_ver_col = batch
+            .column_by_name("bronze_contract_version")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(contract_ver_col.value(0), "2.0.0");
 
         let metrics_file = PathBuf::from(&m2.parquet_path)
             .parent()

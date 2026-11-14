@@ -4,7 +4,8 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use arrow::array::{
-    BooleanArray, Float64Array, Int64Array, StringArray, TimestampMillisecondArray, UInt16Array,
+    BooleanArray, Float64Array, Int32Array, Int64Array, StringArray, TimestampMillisecondArray,
+    UInt16Array,
 };
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
@@ -51,6 +52,17 @@ pub fn bronze_arrow_schema() -> Arc<Schema> {
         Field::new("payload_hash", DataType::Utf8, false),
         Field::new("is_duplicate_payload", DataType::Boolean, false),
         Field::new("raw_payload", DataType::Utf8, true),
+        Field::new("ean_source", DataType::Utf8, true),
+        Field::new("availability_status", DataType::Utf8, false),
+        Field::new("availability_source", DataType::Utf8, false),
+        Field::new("seller_name", DataType::Utf8, true),
+        Field::new("seller_count", DataType::Int32, true),
+        Field::new("is_default_seller", DataType::Boolean, true),
+        Field::new("measurement_unit", DataType::Utf8, true),
+        Field::new("unit_multiplier", DataType::Float64, true),
+        Field::new("query_term", DataType::Utf8, false),
+        Field::new("content_hash", DataType::Utf8, false),
+        Field::new("bronze_contract_version", DataType::Utf8, false),
     ]))
 }
 
@@ -104,6 +116,21 @@ fn build_record_batch(schema: Arc<Schema>, rows: &[BronzeSkuRow]) -> anyhow::Res
     let is_duplicate_payload =
         BooleanArray::from_iter(rows.iter().map(|r| Some(r.is_duplicate_payload)));
     let raw_payload = StringArray::from_iter(rows.iter().map(|r| r.raw_payload.as_deref()));
+    let ean_source = StringArray::from_iter(rows.iter().map(|r| r.ean_source.as_deref()));
+    let availability_status =
+        StringArray::from_iter_values(rows.iter().map(|r| r.availability_status.as_str()));
+    let availability_source =
+        StringArray::from_iter_values(rows.iter().map(|r| r.availability_source.as_str()));
+    let seller_name = StringArray::from_iter(rows.iter().map(|r| r.seller_name.as_deref()));
+    let seller_count = Int32Array::from_iter(rows.iter().map(|r| r.seller_count));
+    let is_default_seller = BooleanArray::from_iter(rows.iter().map(|r| r.is_default_seller));
+    let measurement_unit =
+        StringArray::from_iter(rows.iter().map(|r| r.measurement_unit.as_deref()));
+    let unit_multiplier = Float64Array::from_iter(rows.iter().map(|r| r.unit_multiplier));
+    let query_term = StringArray::from_iter_values(rows.iter().map(|r| r.query_term.as_str()));
+    let content_hash = StringArray::from_iter_values(rows.iter().map(|r| r.content_hash.as_str()));
+    let bronze_contract_version =
+        StringArray::from_iter_values(rows.iter().map(|r| r.bronze_contract_version.as_str()));
 
     RecordBatch::try_new(
         schema,
@@ -137,6 +164,17 @@ fn build_record_batch(schema: Arc<Schema>, rows: &[BronzeSkuRow]) -> anyhow::Res
             Arc::new(payload_hash),
             Arc::new(is_duplicate_payload),
             Arc::new(raw_payload),
+            Arc::new(ean_source),
+            Arc::new(availability_status),
+            Arc::new(availability_source),
+            Arc::new(seller_name),
+            Arc::new(seller_count),
+            Arc::new(is_default_seller),
+            Arc::new(measurement_unit),
+            Arc::new(unit_multiplier),
+            Arc::new(query_term),
+            Arc::new(content_hash),
+            Arc::new(bronze_contract_version),
         ],
     )
     .context("failed to build Arrow RecordBatch for BronzeSkuRow")
@@ -192,7 +230,7 @@ pub fn write_bronze_parquet(
 mod tests {
     use super::*;
     use arrow::array::{
-        Array, BooleanArray, Float64Array, Int64Array, RecordBatchReader, StringArray,
+        Array, BooleanArray, Float64Array, Int32Array, Int64Array, RecordBatchReader, StringArray,
         TimestampMillisecondArray, UInt16Array,
     };
     use arrow::datatypes::{DataType, TimeUnit};
@@ -236,6 +274,17 @@ mod tests {
                 payload_hash: "hash_new".to_string(),
                 is_duplicate_payload: false,
                 raw_payload: Some(r#"{"productId":"20402646"}"#.to_string()),
+                ean_source: Some("item_ean".to_string()),
+                availability_status: "in_stock".to_string(),
+                availability_source: "vtex_offer".to_string(),
+                seller_name: Some("PlazaVea".to_string()),
+                seller_count: Some(2),
+                is_default_seller: Some(true),
+                measurement_unit: Some("un".to_string()),
+                unit_multiplier: Some(1.0),
+                query_term: "lacteos".to_string(),
+                content_hash: "content_new".to_string(),
+                bronze_contract_version: crate::domain::BRONZE_CONTRACT_VERSION.to_string(),
             },
             BronzeSkuRow {
                 retailer: "plazavea".to_string(),
@@ -267,6 +316,17 @@ mod tests {
                 payload_hash: "hash_dup".to_string(),
                 is_duplicate_payload: true,
                 raw_payload: None,
+                ean_source: None,
+                availability_status: "unknown".to_string(),
+                availability_source: "none".to_string(),
+                seller_name: None,
+                seller_count: None,
+                is_default_seller: None,
+                measurement_unit: None,
+                unit_multiplier: None,
+                query_term: "lacteos".to_string(),
+                content_hash: "content_dup".to_string(),
+                bronze_contract_version: crate::domain::BRONZE_CONTRACT_VERSION.to_string(),
             },
         ]
     }
@@ -286,9 +346,9 @@ mod tests {
     }
 
     #[test]
-    fn bronze_arrow_schema_has_exact_29_columns_types_and_nullability() {
+    fn bronze_arrow_schema_has_exact_40_columns_types_and_nullability() {
         let schema = bronze_arrow_schema();
-        assert_eq!(schema.fields().len(), 29);
+        assert_eq!(schema.fields().len(), 40);
 
         let expected = [
             ("retailer", DataType::Utf8, false),
@@ -336,6 +396,29 @@ mod tests {
                 "field {name} nullability mismatch"
             );
         }
+
+        let tail: Vec<(&str, DataType, bool)> = vec![
+            ("ean_source", DataType::Utf8, true),
+            ("availability_status", DataType::Utf8, false),
+            ("availability_source", DataType::Utf8, false),
+            ("seller_name", DataType::Utf8, true),
+            ("seller_count", DataType::Int32, true),
+            ("is_default_seller", DataType::Boolean, true),
+            ("measurement_unit", DataType::Utf8, true),
+            ("unit_multiplier", DataType::Float64, true),
+            ("query_term", DataType::Utf8, false),
+            ("content_hash", DataType::Utf8, false),
+            ("bronze_contract_version", DataType::Utf8, false),
+        ];
+        for (i, (name, ty, nullable)) in tail.iter().enumerate() {
+            let f = schema.field(29 + i);
+            assert_eq!(
+                (f.name().as_str(), f.data_type(), f.is_nullable()),
+                (*name, ty, *nullable),
+                "tail field {} mismatch",
+                29 + i
+            );
+        }
     }
 
     #[test]
@@ -368,7 +451,7 @@ mod tests {
             .unwrap();
         let batch = arrow_reader.next().unwrap().unwrap();
         assert_eq!(batch.num_rows(), 2);
-        assert_eq!(batch.num_columns(), 29);
+        assert_eq!(batch.num_columns(), 40);
 
         let sku_col = batch
             .column_by_name("sku_id")
@@ -448,6 +531,105 @@ mod tests {
             .unwrap();
         assert_eq!(raw_payload_col.value(0), r#"{"productId":"20402646"}"#);
         assert!(raw_payload_col.is_null(1));
+
+        let ean_source_col = batch
+            .column_by_name("ean_source")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(ean_source_col.value(0), "item_ean");
+        assert!(ean_source_col.is_null(1));
+
+        let avail_status_col = batch
+            .column_by_name("availability_status")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(avail_status_col.value(0), "in_stock");
+        assert_eq!(avail_status_col.value(1), "unknown");
+
+        let avail_source_col = batch
+            .column_by_name("availability_source")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(avail_source_col.value(0), "vtex_offer");
+        assert_eq!(avail_source_col.value(1), "none");
+
+        let seller_name_col = batch
+            .column_by_name("seller_name")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(seller_name_col.value(0), "PlazaVea");
+        assert!(seller_name_col.is_null(1));
+
+        let seller_count_col = batch
+            .column_by_name("seller_count")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(seller_count_col.value(0), 2);
+        assert!(seller_count_col.is_null(1));
+
+        let is_default_seller_col = batch
+            .column_by_name("is_default_seller")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .unwrap();
+        assert!(is_default_seller_col.value(0));
+        assert!(is_default_seller_col.is_null(1));
+
+        let meas_unit_col = batch
+            .column_by_name("measurement_unit")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(meas_unit_col.value(0), "un");
+        assert!(meas_unit_col.is_null(1));
+
+        let unit_mult_col = batch
+            .column_by_name("unit_multiplier")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        assert_eq!(unit_mult_col.value(0), 1.0);
+        assert!(unit_mult_col.is_null(1));
+
+        let query_term_col = batch
+            .column_by_name("query_term")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(query_term_col.value(0), "lacteos");
+        assert_eq!(query_term_col.value(1), "lacteos");
+
+        let content_hash_col = batch
+            .column_by_name("content_hash")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(content_hash_col.value(0), "content_new");
+        assert_eq!(content_hash_col.value(1), "content_dup");
+
+        let contract_ver_col = batch
+            .column_by_name("bronze_contract_version")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(contract_ver_col.value(0), "2.0.0");
+        assert_eq!(contract_ver_col.value(1), "2.0.0");
     }
 
     #[test]
@@ -464,7 +646,7 @@ mod tests {
             .unwrap()
             .build()
             .unwrap();
-        assert_eq!(reader.schema().fields().len(), 29);
+        assert_eq!(reader.schema().fields().len(), 40);
         let total_rows: usize = reader.map(|b| b.unwrap().num_rows()).sum();
         assert_eq!(total_rows, 0);
     }

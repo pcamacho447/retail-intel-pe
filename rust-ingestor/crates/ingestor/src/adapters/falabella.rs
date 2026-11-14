@@ -12,7 +12,7 @@ use tokio::sync::Mutex;
 
 use crate::adapter::{FetchContext, PageBatch, RetailerAdapter};
 use crate::adapters::{absolutize_url, encode_url_segment, value_as_string};
-use crate::dedup::compute_payload_hash;
+use crate::dedup::{compute_content_hash, compute_payload_hash};
 use crate::domain::{normalize_opt_string, validate_gtin_mod10, Product, SkuItem};
 use crate::http::RateLimitedHttpClient;
 
@@ -679,6 +679,7 @@ fn parse_results_from_root(
     root: &Value,
     base_url: &str,
     extractor_version: &str,
+    volatile_keys: &[&str],
     ctx: &FetchContext,
 ) -> anyhow::Result<Vec<Product>> {
     let results = root
@@ -696,6 +697,7 @@ fn parse_results_from_root(
     for item in results {
         let raw_payload = serde_json::to_string(item)?;
         let payload_hash = compute_payload_hash(&raw_payload);
+        let content_hash = compute_content_hash(&raw_payload, volatile_keys);
         let product_id = value_as_string(item.get("productId")).ok_or_else(|| {
             anyhow!(
                 "Falabella/Tottus result item missing productId (http_status={})",
@@ -751,10 +753,20 @@ fn parse_results_from_root(
             http_status: ctx.http_status,
             payload_hash,
             raw_payload,
+            query_term: ctx.query_term.clone(),
+            content_hash,
             skus: vec![SkuItem {
                 sku_id,
                 ean,
+                ean_source: None,
+                availability_status: "unknown".to_string(),
+                availability_source: "none".to_string(),
                 seller_id,
+                seller_name: None,
+                seller_count: None,
+                is_default_seller: None,
+                measurement_unit: None,
+                unit_multiplier: None,
                 raw_name,
                 image_url,
                 list_price,
@@ -819,7 +831,13 @@ impl RetailerAdapter for FalabellaListingAdapter {
 
     fn parse_page_payload(&self, body: &str, ctx: &FetchContext) -> anyhow::Result<Vec<Product>> {
         let root = extract_next_data_json(body, ctx.http_status)?;
-        parse_results_from_root(&root, &self.base_url, self.extractor_version(), ctx)
+        parse_results_from_root(
+            &root,
+            &self.base_url,
+            self.extractor_version(),
+            self.volatile_payload_keys(),
+            ctx,
+        )
     }
 
     async fn fetch_page(
@@ -833,8 +851,13 @@ impl RetailerAdapter for FalabellaListingAdapter {
         let resp = self.http.get_text(&url).await?;
         let page_ctx = ctx.clone().with_endpoint(url, resp.status);
         let root = extract_next_data_json(&resp.body, resp.status)?;
-        let mut products =
-            parse_results_from_root(&root, &self.base_url, self.extractor_version(), &page_ctx)?;
+        let mut products = parse_results_from_root(
+            &root,
+            &self.base_url,
+            self.extractor_version(),
+            self.volatile_payload_keys(),
+            &page_ctx,
+        )?;
         let has_more = has_more_pages(&root, products.len(), page_size);
         let mut total_bytes = resp.bytes;
 
@@ -892,6 +915,7 @@ impl RetailerAdapter for FalabellaListingAdapter {
             raw_bytes: total_bytes,
             http_status: resp.status,
             latency_ms: resp.latency_ms,
+            products_rejected: 0,
         })
     }
 }
@@ -1811,5 +1835,22 @@ mod tests {
         let saved_cache = TottusPdpCache::load(&cache_path).unwrap();
         assert!(saved_cache.get("2001").is_none());
         assert!(saved_cache.get("2002").is_some_and(|e| e.pdp_checked));
+    }
+
+    #[test]
+    fn falabella_product_carries_query_term_and_content_hash() {
+        let adapter = FalabellaListingAdapter::new_tottus(test_http());
+        let ctx = FetchContext::for_run(Uuid::new_v4(), "PE", None).with_query_term("leche");
+        let body_a = r#"{"props":{"pageProps":{"results":[{"productId":"P1","skuId":"S1","displayName":"Leche","prices":[]}]}}}"#;
+        let body_b = r#"{"props":{"pageProps":{"results":[{"displayName":"Leche","prices":[],"skuId":"S1","productId":"P1"}]}}}"#;
+
+        let pa = adapter.parse_page_payload(body_a, &ctx).unwrap();
+        let pb = adapter.parse_page_payload(body_b, &ctx).unwrap();
+        assert_eq!(pa.len(), 1);
+        assert_eq!(pa[0].query_term, "leche");
+        assert_eq!(pa[0].content_hash, pb[0].content_hash);
+        assert_eq!(pa[0].skus[0].availability_status, "unknown");
+        assert_eq!(pa[0].skus[0].availability_source, "none");
+        assert_eq!(pa[0].skus[0].ean_source, None);
     }
 }

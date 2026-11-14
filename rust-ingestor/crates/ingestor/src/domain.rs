@@ -2,11 +2,21 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+pub const BRONZE_CONTRACT_VERSION: &str = "2.0.0";
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SkuItem {
     pub sku_id: String,
     pub ean: Option<String>,
+    pub ean_source: Option<String>,
+    pub availability_status: String,
+    pub availability_source: String,
     pub seller_id: Option<String>,
+    pub seller_name: Option<String>,
+    pub seller_count: Option<i32>,
+    pub is_default_seller: Option<bool>,
+    pub measurement_unit: Option<String>,
+    pub unit_multiplier: Option<f64>,
     pub raw_name: String,
     pub image_url: Option<String>,
     pub list_price: Option<f64>,
@@ -37,6 +47,8 @@ pub struct Product {
     pub http_status: u16,
     pub payload_hash: String,
     pub raw_payload: String,
+    pub query_term: String,
+    pub content_hash: String,
     pub skus: Vec<SkuItem>,
 }
 
@@ -71,6 +83,17 @@ pub struct BronzeSkuRow {
     pub payload_hash: String,
     pub is_duplicate_payload: bool,
     pub raw_payload: Option<String>,
+    pub ean_source: Option<String>,
+    pub availability_status: String,
+    pub availability_source: String,
+    pub seller_name: Option<String>,
+    pub seller_count: Option<i32>,
+    pub is_default_seller: Option<bool>,
+    pub measurement_unit: Option<String>,
+    pub unit_multiplier: Option<f64>,
+    pub query_term: String,
+    pub content_hash: String,
+    pub bronze_contract_version: String,
 }
 
 pub fn normalize_opt_string(s: Option<&str>) -> Option<String> {
@@ -170,6 +193,17 @@ impl Product {
                     payload_hash: self.payload_hash.clone(),
                     is_duplicate_payload,
                     raw_payload: raw_payload.clone(),
+                    ean_source: normalize_opt_string(sku.ean_source.as_deref()),
+                    availability_status: sku.availability_status.clone(),
+                    availability_source: sku.availability_source.clone(),
+                    seller_name: normalize_opt_string(sku.seller_name.as_deref()),
+                    seller_count: sku.seller_count,
+                    is_default_seller: sku.is_default_seller,
+                    measurement_unit: normalize_opt_string(sku.measurement_unit.as_deref()),
+                    unit_multiplier: sku.unit_multiplier,
+                    query_term: self.query_term.clone(),
+                    content_hash: self.content_hash.clone(),
+                    bronze_contract_version: BRONZE_CONTRACT_VERSION.to_string(),
                 }
             })
             .collect()
@@ -203,6 +237,8 @@ mod tests {
             http_status: 200,
             payload_hash: "abc123def456".to_string(),
             raw_payload: r#"{"productId":"prod-100"}"#.to_string(),
+            query_term: "lacteos".to_string(),
+            content_hash: "content123def456".to_string(),
             skus,
         }
     }
@@ -261,7 +297,15 @@ mod tests {
             SkuItem {
                 sku_id: "sku-1".to_string(),
                 ean: Some("7750243012345".to_string()),
+                ean_source: None,
+                availability_status: "unknown".to_string(),
+                availability_source: "none".to_string(),
                 seller_id: Some("1".to_string()),
+                seller_name: None,
+                seller_count: None,
+                is_default_seller: None,
+                measurement_unit: None,
+                unit_multiplier: None,
                 raw_name: "Leche Gloria 390g Unidad".to_string(),
                 image_url: Some("https://img.example.com/1.jpg".to_string()),
                 list_price: Some(4.50),
@@ -273,7 +317,15 @@ mod tests {
             SkuItem {
                 sku_id: "sku-2".to_string(),
                 ean: Some("   ".to_string()),
+                ean_source: None,
+                availability_status: "unknown".to_string(),
+                availability_source: "none".to_string(),
                 seller_id: None,
+                seller_name: None,
+                seller_count: None,
+                is_default_seller: None,
+                measurement_unit: None,
+                unit_multiplier: None,
                 raw_name: "Leche Gloria 390g Sixpack".to_string(),
                 image_url: None,
                 list_price: Some(25.0),
@@ -319,7 +371,15 @@ mod tests {
         let product = sample_product(vec![SkuItem {
             sku_id: "sku-1".to_string(),
             ean: None,
+            ean_source: None,
+            availability_status: "unknown".to_string(),
+            availability_source: "none".to_string(),
             seller_id: Some("1".to_string()),
+            seller_name: None,
+            seller_count: None,
+            is_default_seller: None,
+            measurement_unit: None,
+            unit_multiplier: None,
             raw_name: "Leche Gloria 390g".to_string(),
             image_url: None,
             list_price: Some(4.50),
@@ -341,5 +401,46 @@ mod tests {
         let product = sample_product(vec![]);
         let rows = product.to_bronze_rows(false);
         assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn to_bronze_rows_propagates_contract_v2_fields() {
+        let mut product = sample_product(vec![SkuItem {
+            sku_id: "sku-v2".to_string(),
+            ean: Some("7750243012345".to_string()),
+            ean_source: Some("item_ean".to_string()),
+            availability_status: "in_stock".to_string(),
+            availability_source: "vtex_offer".to_string(),
+            seller_id: Some("1".to_string()),
+            seller_name: Some("PlazaVea".to_string()),
+            seller_count: Some(2),
+            is_default_seller: Some(true),
+            measurement_unit: Some("kg".to_string()),
+            unit_multiplier: Some(0.1),
+            raw_name: "Queso Edam".to_string(),
+            image_url: None,
+            list_price: Some(49.9),
+            selling_price: Some(45.0),
+            card_price: None,
+            card_program: None,
+            available_qty: Some(15),
+        }]);
+        product.query_term = "lacteos".to_string();
+        product.content_hash = "abc".to_string();
+
+        let rows = product.to_bronze_rows(false);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].ean_source.as_deref(), Some("item_ean"));
+        assert_eq!(rows[0].availability_status, "in_stock");
+        assert_eq!(rows[0].availability_source, "vtex_offer");
+        assert_eq!(rows[0].seller_name.as_deref(), Some("PlazaVea"));
+        assert_eq!(rows[0].seller_count, Some(2));
+        assert_eq!(rows[0].is_default_seller, Some(true));
+        assert_eq!(rows[0].measurement_unit.as_deref(), Some("kg"));
+        assert_eq!(rows[0].unit_multiplier, Some(0.1));
+        assert_eq!(rows[0].query_term, "lacteos");
+        assert_eq!(rows[0].content_hash, "abc");
+        assert_eq!(rows[0].bronze_contract_version, BRONZE_CONTRACT_VERSION);
+        assert_eq!(rows[0].bronze_contract_version, "2.0.0");
     }
 }

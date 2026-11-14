@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 /// Computes the deterministic lowercase hexadecimal SHA-256 digest of a raw JSON payload.
@@ -11,6 +12,41 @@ pub fn compute_payload_hash(raw_payload: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(raw_payload.as_bytes());
     hex::encode(hasher.finalize())
+}
+
+fn strip_volatile_keys(value: &mut Value, volatile_keys: &[&str]) {
+    match value {
+        Value::Object(map) => {
+            for key in volatile_keys {
+                map.remove(*key);
+            }
+            for child in map.values_mut() {
+                strip_volatile_keys(child, volatile_keys);
+            }
+        }
+        Value::Array(arr) => {
+            for child in arr {
+                strip_volatile_keys(child, volatile_keys);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Computes the SHA-256 content hash after stripping volatile JSON keys at any depth
+/// and serializing with canonical key ordering. Falls back to `compute_payload_hash`
+/// when `raw_payload` is not valid JSON.
+pub fn compute_content_hash(raw_payload: &str, volatile_keys: &[&str]) -> String {
+    let Ok(mut parsed) = serde_json::from_str::<Value>(raw_payload) else {
+        return compute_payload_hash(raw_payload);
+    };
+    if !volatile_keys.is_empty() {
+        strip_volatile_keys(&mut parsed, volatile_keys);
+    }
+    match serde_json::to_string(&parsed) {
+        Ok(canonical) => compute_payload_hash(&canonical),
+        Err(_) => compute_payload_hash(raw_payload),
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -84,6 +120,30 @@ mod tests {
         assert_eq!(
             compute_payload_hash(r#"{"productId":"123"}"#),
             compute_payload_hash(r#"{"productId":"123"}"#)
+        );
+    }
+
+    #[test]
+    fn compute_content_hash_ignores_volatile_keys_and_key_order() {
+        let keys = [
+            "PriceToken",
+            "PriceValidUntil",
+            "CacheVersionUsedToCallCheckout",
+        ];
+        let a = r#"{"productId":"1","items":[{"itemId":"9","sellers":[{"commertialOffer":{"Price":4.9,"PriceToken":"aaa","PriceValidUntil":"2026-11-14T01:00:00Z","CacheVersionUsedToCallCheckout":"x_1"}}]}]}"#;
+        let b = r#"{"items":[{"sellers":[{"commertialOffer":{"PriceToken":"bbb","Price":4.9,"CacheVersionUsedToCallCheckout":"x_2","PriceValidUntil":"2026-11-14T01:30:00Z"}}],"itemId":"9"}],"productId":"1"}"#;
+        let c = r#"{"productId":"1","items":[{"itemId":"9","sellers":[{"commertialOffer":{"Price":5.1,"PriceToken":"aaa"}}]}]}"#;
+        assert_eq!(
+            compute_content_hash(a, &keys),
+            compute_content_hash(b, &keys)
+        );
+        assert_ne!(
+            compute_content_hash(a, &keys),
+            compute_content_hash(c, &keys)
+        );
+        assert_eq!(
+            compute_content_hash("<html>", &keys),
+            compute_payload_hash("<html>")
         );
     }
 

@@ -15,6 +15,7 @@ pub struct FetchContext {
     pub source_endpoint: String,
     pub http_status: u16,
     pub scraped_at: DateTime<Utc>,
+    pub query_term: String,
 }
 
 impl FetchContext {
@@ -33,6 +34,7 @@ impl FetchContext {
             source_endpoint: String::new(),
             http_status: 200,
             scraped_at: Utc::now(),
+            query_term: String::new(),
         }
     }
 
@@ -40,6 +42,11 @@ impl FetchContext {
         self.source_endpoint = endpoint.into();
         self.http_status = http_status;
         self.scraped_at = Utc::now();
+        self
+    }
+
+    pub fn with_query_term(mut self, term: impl Into<String>) -> Self {
+        self.query_term = term.into();
         self
     }
 }
@@ -52,6 +59,7 @@ pub struct PageBatch {
     pub raw_bytes: usize,
     pub http_status: u16,
     pub latency_ms: f64,
+    pub products_rejected: usize,
 }
 
 #[async_trait]
@@ -67,6 +75,14 @@ pub trait RetailerAdapter: Send + Sync {
         page_size: usize,
         ctx: &FetchContext,
     ) -> anyhow::Result<PageBatch>;
+
+    fn volatile_payload_keys(&self) -> &'static [&'static str] {
+        &[]
+    }
+
+    fn applies_geo_context(&self) -> bool {
+        false
+    }
 }
 
 #[cfg(test)]
@@ -119,6 +135,7 @@ mod tests {
                 raw_bytes: 2,
                 http_status: 200,
                 latency_ms: 1.0,
+                products_rejected: 0,
             })
         }
     }
@@ -136,6 +153,10 @@ mod tests {
         assert_eq!(ctx.sales_channel, "ecommerce");
         assert_eq!(ctx.source_endpoint, "https://www.plazavea.com.pe/api/test");
         assert_eq!(ctx.http_status, 206);
+        assert_eq!(ctx.query_term, "");
+
+        let ctx_with_term = ctx.with_query_term("lacteos");
+        assert_eq!(ctx_with_term.query_term, "lacteos");
     }
 
     #[tokio::test]
@@ -143,6 +164,8 @@ mod tests {
         let adapter: Box<dyn RetailerAdapter> = Box::new(DummyAdapter);
         assert_eq!(adapter.retailer_slug(), "dummy");
         assert_eq!(adapter.extractor_version(), "0.1.0");
+        assert!(adapter.volatile_payload_keys().is_empty());
+        assert!(!adapter.applies_geo_context());
         assert_eq!(
             adapter.build_page_url("lacteos", 0, 20),
             "https://example.com/lacteos?offset=0&limit=20"
@@ -153,5 +176,6 @@ mod tests {
         assert_eq!(batch.http_status, 200);
         assert!(!batch.has_more);
         assert_eq!(batch.next_offset, 20);
+        assert_eq!(batch.products_rejected, 0);
     }
 }
