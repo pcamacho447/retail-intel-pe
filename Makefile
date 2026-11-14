@@ -1,4 +1,4 @@
-.PHONY: verify verify-rust verify-py
+.PHONY: verify verify-rust verify-py gate
 
 verify: verify-rust verify-py
 
@@ -7,3 +7,6 @@ verify-rust:
 
 verify-py:
 	.venv/bin/pytest -q
+
+gate:
+	.venv/bin/python scripts/inspect_bronze.py --bronze-dir data/bronze --gate

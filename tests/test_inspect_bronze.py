@@ -5,6 +5,8 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
+from typing import Any
+
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
@@ -13,7 +15,12 @@ ROOT_DIR = Path(__file__).resolve().parent.parent
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-from scripts.inspect_bronze import audit_bronze, format_markdown_report, main  # noqa: E402
+from scripts.inspect_bronze import (  # noqa: E402
+    audit_bronze,
+    evaluate_gate,
+    format_markdown_report,
+    main,
+)
 
 BRONZE_ARROW_SCHEMA = pa.schema(
     [
@@ -48,6 +55,97 @@ BRONZE_ARROW_SCHEMA = pa.schema(
         pa.field("raw_payload", pa.string(), nullable=True),
     ]
 )
+
+BRONZE_V2_ARROW_SCHEMA = pa.schema(
+    list(BRONZE_ARROW_SCHEMA)
+    + [
+        pa.field("ean_source", pa.string(), nullable=True),
+        pa.field("availability_status", pa.string(), nullable=False),
+        pa.field("availability_source", pa.string(), nullable=False),
+        pa.field("seller_name", pa.string(), nullable=True),
+        pa.field("seller_count", pa.int32(), nullable=True),
+        pa.field("is_default_seller", pa.bool_(), nullable=True),
+        pa.field("measurement_unit", pa.string(), nullable=True),
+        pa.field("unit_multiplier", pa.float64(), nullable=True),
+        pa.field("query_term", pa.string(), nullable=False),
+        pa.field("content_hash", pa.string(), nullable=False),
+        pa.field("bronze_contract_version", pa.string(), nullable=False),
+    ]
+)
+
+
+def _v2_row(**overrides: Any) -> dict[str, Any]:
+    retailer = str(overrides.get("retailer", "plazavea"))
+    sku_id = str(overrides.get("sku_id", "sku-1"))
+    product_id = str(overrides.get("product_id", "prod-1"))
+    row: dict[str, Any] = {
+        "retailer": retailer,
+        "market_id": "PE",
+        "store_id": None,
+        "sku_id": sku_id,
+        "product_id": product_id,
+        "ean": "7751271031103",
+        "seller_id": "1",
+        "raw_name": f"Producto {sku_id}",
+        "brand": "Gloria",
+        "category_path": "Lácteos/Leches",
+        "raw_description": "Descripción de prueba v2",
+        "product_url": f"https://example.com/{retailer}/{sku_id}",
+        "image_url": f"https://example.com/img/{sku_id}.jpg",
+        "list_price": 12.0,
+        "selling_price": 10.0,
+        "card_price": None,
+        "card_program": None,
+        "available_qty": 5,
+        "currency": "PEN",
+        "sales_channel": "ecommerce",
+        "postal_code": None,
+        "scraped_at": datetime(2026, 11, 14, 18, 0, 0, tzinfo=timezone.utc),
+        "extraction_run_id": "run-v2-1",
+        "extractor_version": "vtex-catalog-v1.1.0+abc1234",
+        "source_endpoint": f"https://api.example.com/{retailer}/catalog",
+        "http_status": 200,
+        "payload_hash": f"ph-{product_id}",
+        "is_duplicate_payload": False,
+        "raw_payload": f'{{"id":"{product_id}"}}',
+        "ean_source": "item_ean",
+        "availability_status": "in_stock",
+        "availability_source": "vtex_offer",
+        "seller_name": "Plaza Vea",
+        "seller_count": 1,
+        "is_default_seller": True,
+        "measurement_unit": "un",
+        "unit_multiplier": 1.0,
+        "query_term": "lacteos",
+        "content_hash": f"ch-{product_id}",
+        "bronze_contract_version": "2.0.0",
+    }
+    if "ean" in overrides and overrides["ean"] is None and "ean_source" not in overrides:
+        row["ean_source"] = None
+    row.update(overrides)
+    return row
+
+
+def _write_metrics_json(
+    bronze_dir: Path,
+    *,
+    dt: str,
+    retailer: str,
+    run_id: str,
+    status: str,
+) -> Path:
+    part_dir = bronze_dir / f"dt={dt}" / f"retailer={retailer}"
+    part_dir.mkdir(parents=True, exist_ok=True)
+    out_path = part_dir / f"metrics-{run_id}.json"
+    payload = {
+        "extraction_run_id": run_id,
+        "retailer": retailer,
+        "extractor_version": "vtex-catalog-v1.1.0+abc1234",
+        "bronze_contract_version": "2.0.0",
+        "status": status,
+    }
+    out_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    return out_path
 
 
 def _make_row(
@@ -107,11 +205,12 @@ def _write_bronze_partition(
     retailer: str,
     filename: str,
     rows: list[dict],
+    schema: pa.Schema = BRONZE_ARROW_SCHEMA,
 ) -> Path:
     part_dir = bronze_dir / f"dt={dt}" / f"retailer={retailer}"
     part_dir.mkdir(parents=True, exist_ok=True)
     out_path = part_dir / filename
-    table = pa.Table.from_pylist(rows, schema=BRONZE_ARROW_SCHEMA)
+    table = pa.Table.from_pylist(rows, schema=schema)
     pq.write_table(table, out_path, compression="zstd", compression_level=3)
     return out_path
 
@@ -312,29 +411,38 @@ def test_duplicate_rates_flag_hash_and_null_raw_payload(sample_bronze_dir: Path)
     report = audit_bronze(sample_bronze_dir)
 
     pv = report["by_retailer"]["plazavea"]
+    assert pv["product_observations"] == 3
     assert pv["duplicate_flag_count"] == 2
     assert pv["duplicate_flag_pct"] == pytest.approx(40.0, rel=1e-4)
     assert pv["distinct_payload_hashes"] == 3
-    assert pv["hash_duplicates_count"] == 2
-    assert pv["hash_duplicates_pct"] == pytest.approx(40.0, rel=1e-4)
+    assert pv["hash_duplicates_count"] == 0
+    assert pv["hash_duplicates_pct"] == pytest.approx(0.0, rel=1e-4)
+    assert pv["multi_sku_fanout_count"] == 2
+    assert pv["multi_sku_fanout_pct"] == pytest.approx(40.0, rel=1e-4)
     assert pv["raw_payload_null_count"] == 2
     assert pv["raw_payload_null_pct"] == pytest.approx(40.0, rel=1e-4)
 
     metro = report["by_retailer"]["metro"]
+    assert metro["product_observations"] == 2
     assert metro["duplicate_flag_count"] == 1
     assert metro["duplicate_flag_pct"] == pytest.approx(25.0, rel=1e-4)
     assert metro["distinct_payload_hashes"] == 2
-    assert metro["hash_duplicates_count"] == 2
-    assert metro["hash_duplicates_pct"] == pytest.approx(50.0, rel=1e-4)
+    assert metro["hash_duplicates_count"] == 0
+    assert metro["hash_duplicates_pct"] == pytest.approx(0.0, rel=1e-4)
+    assert metro["multi_sku_fanout_count"] == 2
+    assert metro["multi_sku_fanout_pct"] == pytest.approx(50.0, rel=1e-4)
     assert metro["raw_payload_null_count"] == 1
     assert metro["raw_payload_null_pct"] == pytest.approx(25.0, rel=1e-4)
 
     total = report["total"]
+    assert total["product_observations"] == 5
     assert total["duplicate_flag_count"] == 3
     assert total["duplicate_flag_pct"] == pytest.approx(33.33, rel=1e-3)
     assert total["distinct_payload_hashes"] == 5
-    assert total["hash_duplicates_count"] == 4
-    assert total["hash_duplicates_pct"] == pytest.approx(44.44, rel=1e-3)
+    assert total["hash_duplicates_count"] == 0
+    assert total["hash_duplicates_pct"] == pytest.approx(0.0, rel=1e-4)
+    assert total["multi_sku_fanout_count"] == 4
+    assert total["multi_sku_fanout_pct"] == pytest.approx(44.44, rel=1e-3)
     assert total["raw_payload_null_count"] == 3
     assert total["raw_payload_null_pct"] == pytest.approx(33.33, rel=1e-3)
 
@@ -769,15 +877,22 @@ def test_multi_sku_fanout_separates_1_to_n_from_duplicate_flags(tmp_path: Path) 
     metro = report["by_retailer"]["metro"]
     assert metro["row_count"] == 4
     assert metro["unique_products"] == 2
+    assert metro["product_observations"] == 2
     assert metro["unique_skus"] == 4
     assert metro["duplicate_flag_count"] == 1
     assert metro["duplicate_flag_pct"] == pytest.approx(25.0)
+    assert metro["hash_duplicates_count"] == 0
+    assert metro["hash_duplicates_pct"] == pytest.approx(0.0)
     assert metro["multi_sku_fanout_count"] == 2
     assert metro["multi_sku_fanout_pct"] == pytest.approx(50.0)
+    assert report["total"]["product_observations"] == 2
+    assert report["total"]["hash_duplicates_count"] == 0
     assert report["total"]["multi_sku_fanout_count"] == 2
     assert report["total"]["multi_sku_fanout_pct"] == pytest.approx(50.0)
 
     md = format_markdown_report(report)
+    assert "EAN no nulo (%)" in md
+    assert "EAN Valid (%)" not in md
     assert "EAN Mod-10 (%)" in md
     assert "1:N Fanout (%)" in md
 
@@ -910,11 +1025,23 @@ def test_card_program_counts_sample_products_and_markdown_sections(tmp_path: Pat
 def test_legacy_28_column_parquet_and_empty_metrics_include_new_fields(tmp_path: Path) -> None:
     empty_report = audit_bronze(tmp_path / "missing")
     assert empty_report["sample_products"] == []
+    assert empty_report["total"]["product_observations"] == 0
     assert empty_report["total"]["ean_mod10_valid_count"] == 0
     assert empty_report["total"]["ean_mod10_valid_pct"] == 0.0
     assert empty_report["total"]["multi_sku_fanout_count"] == 0
     assert empty_report["total"]["multi_sku_fanout_pct"] == 0.0
     assert empty_report["total"]["card_program_counts"] == {}
+    assert empty_report["total"]["gtin_class_counts"] == {}
+    assert empty_report["total"]["ean_source_counts"] == {}
+    assert empty_report["total"]["availability_status_counts"] == {}
+    assert empty_report["gate_inputs"] == {
+        "contract_versions": {},
+        "ean_without_source_rows": 0,
+        "seed_ean_source_rows": 0,
+        "availability_invalid_rows": 0,
+        "dirty_or_nogit_version_rows": 0,
+        "run_statuses": {},
+    }
 
     legacy_dir = tmp_path / "legacy_28col"
     part_dir = legacy_dir / "dt=2026-11-13" / "retailer=plazavea"
@@ -1022,3 +1149,402 @@ def test_schema_has_29_columns_and_samples_cap_at_16_across_mixed_schemas(tmp_pa
     assert len(report["sample_products"]) == 16
     sampled_retailers = {item["retailer"] for item in report["sample_products"]}
     assert sampled_retailers == {"plazavea", "metro", "wong", "tottus"}
+
+
+def test_gate_passes_on_contract_v2_fixture(tmp_path: Path) -> None:
+    assert len(BRONZE_V2_ARROW_SCHEMA) == 40
+    rows = [
+        _v2_row(
+            retailer="plazavea",
+            sku_id="pv-s1",
+            product_id="pv-p1",
+            ean="7751271031103",
+            ean_source="item_ean",
+            availability_status="in_stock",
+            availability_source="vtex_offer",
+            payload_hash="ph-1",
+            content_hash="ch-1",
+        ),
+        _v2_row(
+            retailer="plazavea",
+            sku_id="pv-s2",
+            product_id="pv-p2",
+            ean=None,
+            ean_source=None,
+            availability_status="unknown",
+            availability_source="none",
+            available_qty=None,
+            payload_hash="ph-2",
+            content_hash="ch-2",
+        ),
+    ]
+    _write_bronze_partition(
+        tmp_path,
+        dt="2026-11-14",
+        retailer="plazavea",
+        filename="part-run-v2-1.parquet",
+        rows=rows,
+        schema=BRONZE_V2_ARROW_SCHEMA,
+    )
+    _write_metrics_json(
+        tmp_path,
+        dt="2026-11-14",
+        retailer="plazavea",
+        run_id="run-v2-1",
+        status="success",
+    )
+
+    report = audit_bronze(tmp_path)
+    assert report["gate_inputs"]["contract_versions"] == {"2.0.0": 2}
+    assert report["gate_inputs"]["run_statuses"] == {"success": 1}
+    assert report["total"]["ean_source_counts"] == {"item_ean": 1}
+    assert report["total"]["availability_status_counts"] == {"in_stock": 1, "unknown": 1}
+    assert evaluate_gate(report) == []
+    assert main(["--bronze-dir", str(tmp_path), "--gate"]) == 0
+
+
+def test_gate_flags_seeded_ean_source_and_missing_provenance(tmp_path: Path) -> None:
+    rows = [
+        _v2_row(
+            retailer="tottus",
+            sku_id="tt-s1",
+            product_id="tt-p1",
+            ean="7751271031103",
+            ean_source=None,
+            payload_hash="ph-tt-1",
+            content_hash="ch-tt-1",
+        ),
+        _v2_row(
+            retailer="tottus",
+            sku_id="tt-s2",
+            product_id="tt-p2",
+            ean="7751271034142",
+            ean_source="vtex_crossref_gtin13_seed",
+            payload_hash="ph-tt-2",
+            content_hash="ch-tt-2",
+        ),
+    ]
+    _write_bronze_partition(
+        tmp_path,
+        dt="2026-11-14",
+        retailer="tottus",
+        filename="part-run-v2-1.parquet",
+        rows=rows,
+        schema=BRONZE_V2_ARROW_SCHEMA,
+    )
+
+    report = audit_bronze(tmp_path)
+    assert report["gate_inputs"]["ean_without_source_rows"] == 1
+    assert report["gate_inputs"]["seed_ean_source_rows"] == 1
+    assert "G2_EAN_PROVENANCE" in evaluate_gate(report)
+
+
+def test_gate_flags_invalid_availability_domain_and_none_source_mismatch(tmp_path: Path) -> None:
+    rows = [
+        _v2_row(
+            retailer="tottus",
+            sku_id="tt-1",
+            product_id="tt-p1",
+            availability_status="bogus_status",
+            availability_source="tottus_listing_flag",
+            payload_hash="ph-1",
+        ),
+        _v2_row(
+            retailer="tottus",
+            sku_id="tt-2",
+            product_id="tt-p2",
+            availability_status="in_stock",
+            availability_source="none",
+            payload_hash="ph-2",
+        ),
+        _v2_row(
+            retailer="tottus",
+            sku_id="tt-3",
+            product_id="tt-p3",
+            availability_status="in_stock",
+            availability_source="fabricated_cache",
+            payload_hash="ph-3",
+        ),
+    ]
+    _write_bronze_partition(
+        tmp_path,
+        dt="2026-11-14",
+        retailer="tottus",
+        filename="part-run-v2-1.parquet",
+        rows=rows,
+        schema=BRONZE_V2_ARROW_SCHEMA,
+    )
+
+    report = audit_bronze(tmp_path)
+    assert report["gate_inputs"]["availability_invalid_rows"] == 3
+    assert "G3_AVAILABILITY_DOMAIN" in evaluate_gate(report)
+
+
+def test_gate_flags_dirty_extractor_version_and_legacy_contract(tmp_path: Path) -> None:
+    v2_rows = [
+        _v2_row(
+            retailer="plazavea",
+            sku_id="pv-1",
+            product_id="pv-p1",
+            extractor_version="vtex-catalog-v1.1.0+abc1234-dirty",
+            payload_hash="ph-pv-1",
+        ),
+        _v2_row(
+            retailer="plazavea",
+            sku_id="pv-2",
+            product_id="pv-p2",
+            extractor_version="vtex-catalog-v1.1.0+nogit",
+            payload_hash="ph-pv-2",
+        ),
+    ]
+    _write_bronze_partition(
+        tmp_path,
+        dt="2026-11-14",
+        retailer="plazavea",
+        filename="part-v2.parquet",
+        rows=v2_rows,
+        schema=BRONZE_V2_ARROW_SCHEMA,
+    )
+    legacy_row = _make_row(
+        retailer="metro",
+        sku_id="mt-1",
+        product_id="mt-p1",
+        ean="7751271034142",
+        list_price=10.0,
+        selling_price=9.0,
+        card_price=None,
+        available_qty=4,
+        payload_hash="ph-mt-1",
+        is_duplicate_payload=False,
+        raw_payload="{}",
+        run_id="run-legacy",
+    )
+    _write_bronze_partition(
+        tmp_path,
+        dt="2026-11-13",
+        retailer="metro",
+        filename="part-legacy.parquet",
+        rows=[legacy_row],
+        schema=BRONZE_ARROW_SCHEMA,
+    )
+
+    report = audit_bronze(tmp_path)
+    assert report["gate_inputs"]["dirty_or_nogit_version_rows"] == 2
+    assert report["gate_inputs"]["contract_versions"] == {"2.0.0": 2, "legacy": 1}
+    violations = evaluate_gate(report)
+    assert "G4_EXTRACTOR_VERSION" in violations and "G1_CONTRACT_VERSION" in violations
+
+
+def test_gate_truncated_run_needs_allow_flag(tmp_path: Path) -> None:
+    _write_bronze_partition(
+        tmp_path,
+        dt="2026-11-14",
+        retailer="plazavea",
+        filename="part-run-v2-1.parquet",
+        rows=[_v2_row()],
+        schema=BRONZE_V2_ARROW_SCHEMA,
+    )
+    _write_metrics_json(
+        tmp_path,
+        dt="2026-11-14",
+        retailer="plazavea",
+        run_id="run-v2-1",
+        status="truncated",
+    )
+
+    report = audit_bronze(tmp_path)
+    assert evaluate_gate(report) == ["G5_RUN_STATUS"]
+    assert evaluate_gate(report, allow_truncated=True) == []
+    assert main(["--bronze-dir", str(tmp_path), "--gate"]) == 1
+    assert main(["--bronze-dir", str(tmp_path), "--gate", "--allow-truncated"]) == 0
+
+    _write_metrics_json(
+        tmp_path,
+        dt="2026-11-14",
+        retailer="metro",
+        run_id="run-v2-2",
+        status="partial_error",
+    )
+    partial_report = audit_bronze(tmp_path)
+    assert evaluate_gate(partial_report, allow_truncated=True) == ["G5_RUN_STATUS"]
+
+
+def test_hash_duplicates_not_confounded_by_multi_sku_fanout(tmp_path: Path) -> None:
+    rows = [
+        _v2_row(
+            retailer="metro",
+            sku_id="s1",
+            product_id="p1",
+            extraction_run_id="run-1",
+            source_endpoint="https://api.example.com/metro/catalog?O=0,19",
+            payload_hash="ph-p1",
+        ),
+        _v2_row(
+            retailer="metro",
+            sku_id="s2",
+            product_id="p1",
+            extraction_run_id="run-1",
+            source_endpoint="https://api.example.com/metro/catalog?O=0,19",
+            payload_hash="ph-p1",
+        ),
+        _v2_row(
+            retailer="metro",
+            sku_id="s3",
+            product_id="p1",
+            extraction_run_id="run-1",
+            source_endpoint="https://api.example.com/metro/catalog?O=0,19",
+            payload_hash="ph-p1",
+        ),
+    ]
+    _write_bronze_partition(
+        tmp_path,
+        dt="2026-11-14",
+        retailer="metro",
+        filename="part-run-1.parquet",
+        rows=rows,
+        schema=BRONZE_V2_ARROW_SCHEMA,
+    )
+
+    m = audit_bronze(tmp_path)["total"]
+    assert m["product_observations"] == 1
+    assert (m["hash_duplicates_count"], m["multi_sku_fanout_count"]) == (0, 2)
+
+    # Second run observes the exact same 3-SKU product with the same payload_hash -> 1 hash duplicate observation
+    run2_rows = [
+        _v2_row(
+            retailer="metro",
+            sku_id=f"s{i}",
+            product_id="p1",
+            extraction_run_id="run-2",
+            source_endpoint="https://api.example.com/metro/catalog?O=0,19",
+            payload_hash="ph-p1",
+            is_duplicate_payload=True,
+            raw_payload=None,
+        )
+        for i in (1, 2, 3)
+    ]
+    _write_bronze_partition(
+        tmp_path,
+        dt="2026-11-15",
+        retailer="metro",
+        filename="part-run-2.parquet",
+        rows=run2_rows,
+        schema=BRONZE_V2_ARROW_SCHEMA,
+    )
+    m2 = audit_bronze(tmp_path)["total"]
+    assert m2["product_observations"] == 2
+    assert m2["distinct_payload_hashes"] == 1
+    assert (m2["hash_duplicates_count"], m2["multi_sku_fanout_count"]) == (1, 4)
+
+
+def test_gtin_class_counts(tmp_path: Path) -> None:
+    eans = ["7751271031103", "2000000000008", "20181512", "123456789", None]
+    rows = [
+        _v2_row(
+            retailer="plazavea",
+            sku_id=f"s-{idx}",
+            product_id=f"p-{idx}",
+            ean=ean,
+            ean_source="item_ean" if ean is not None else None,
+            payload_hash=f"ph-{idx}",
+        )
+        for idx, ean in enumerate(eans)
+    ]
+    _write_bronze_partition(
+        tmp_path,
+        dt="2026-11-14",
+        retailer="plazavea",
+        filename="part-gtin.parquet",
+        rows=rows,
+        schema=BRONZE_V2_ARROW_SCHEMA,
+    )
+
+    assert audit_bronze(tmp_path)["total"]["gtin_class_counts"] == {
+        "global_candidate": 1,
+        "restricted_circulation": 2,
+        "bad_length": 1,
+        "missing": 1,
+    }
+
+
+def test_cli_gate_exit_code_is_1_on_violation(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    legacy_row = _make_row(
+        retailer="plazavea",
+        sku_id="leg-1",
+        product_id="leg-p1",
+        ean="7751271031103",
+        list_price=10.0,
+        selling_price=9.0,
+        card_price=None,
+        available_qty=5,
+        payload_hash="ph-leg-1",
+        is_duplicate_payload=False,
+        raw_payload="{}",
+        run_id="run-leg-1",
+    )
+    _write_bronze_partition(
+        tmp_path,
+        dt="2026-11-13",
+        retailer="plazavea",
+        filename="part-leg.parquet",
+        rows=[legacy_row],
+        schema=BRONZE_ARROW_SCHEMA,
+    )
+
+    assert main(["--bronze-dir", str(tmp_path), "--gate"]) == 1
+    captured = capsys.readouterr()
+    assert "G1_CONTRACT_VERSION" in captured.err
+
+
+def test_gtin_class_counts_non_numeric_and_gtin8_prefix_0(tmp_path: Path) -> None:
+    eans = ["abc123", "01234567", "012345678905", "17750151008669"]
+    rows = [
+        _v2_row(
+            retailer="metro",
+            sku_id=f"s-{idx}",
+            product_id=f"p-{idx}",
+            ean=ean,
+            ean_source="item_ean",
+            payload_hash=f"ph-{idx}",
+        )
+        for idx, ean in enumerate(eans)
+    ]
+    _write_bronze_partition(
+        tmp_path,
+        dt="2026-11-14",
+        retailer="metro",
+        filename="part-gtin-extra.parquet",
+        rows=rows,
+        schema=BRONZE_V2_ARROW_SCHEMA,
+    )
+
+    assert audit_bronze(tmp_path)["by_retailer"]["metro"]["gtin_class_counts"] == {
+        "global_candidate": 2,
+        "non_numeric": 1,
+        "restricted_circulation": 1,
+    }
+
+
+def test_gate_flags_partial_error_without_parquet_and_corrupt_metrics(tmp_path: Path) -> None:
+    _write_metrics_json(
+        tmp_path,
+        dt="2026-11-14",
+        retailer="tottus",
+        run_id="run-err",
+        status="partial_error",
+    )
+    report = audit_bronze(tmp_path)
+    assert report["has_data"] is False
+    assert report["gate_inputs"]["run_statuses"] == {"partial_error": 1}
+    assert evaluate_gate(report, allow_truncated=True) == ["G5_RUN_STATUS"]
+    assert "Run Statuses" in format_markdown_report(report)
+
+    bad_dir = tmp_path / "corrupt"
+    metrics_dir = bad_dir / "dt=2026-11-14" / "retailer=tottus"
+    metrics_dir.mkdir(parents=True)
+    (metrics_dir / "metrics-bad.json").write_text("{broken json", encoding="utf-8")
+    corrupt_report = audit_bronze(bad_dir)
+    assert corrupt_report["gate_inputs"]["run_statuses"] == {"invalid": 1}
+    assert evaluate_gate(corrupt_report) == ["G5_RUN_STATUS"]
